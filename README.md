@@ -8,6 +8,19 @@ Laptop agent -> bridge CLI -> Railway relay <- VM connector -> shared VM folder
 
 Both clients connect outward. File requests work while the connector is running, even if that computer's AI agent is idle. Agent messages remain in a mailbox until an active peer checks it. The bridge does not wake an existing chat, invoke a model, or share chat history automatically.
 
+## Live deployment
+
+Relay origin: `https://agent-bridge-production-2405.up.railway.app`. The [health check](https://agent-bridge-production-2405.up.railway.app/healthz) is public; API calls require a device token. Railway is connected to this repository's `main` branch, with successful GitHub checks required before automatic deployment.
+
+On a laptop with the Railway CLI already signed in, register a device without printing the administrator secret:
+
+```sh
+bridge config set --url https://agent-bridge-production-2405.up.railway.app
+npx @railway/cli run --service agent-bridge -- node dist/cli.js register laptop
+```
+
+Then select a shared root, install the skill into your participating project, and run `bridge connect` as shown below. Other computers need their own registered token and selected folders.
+
 ## Build and run locally
 
 Requires Node.js 24 or newer on each computer. Clone this repo, then:
@@ -92,7 +105,7 @@ Uploads and downloads stream file bytes; long polling carries small JSON message
 
 The repository includes a Dockerfile and `.railway/railway.ts` using Railway's current infrastructure format. Preview it with `npx @railway/cli config plan` and apply with `npx @railway/cli config apply`. It preserves secrets already configured on Railway. Deploy one service, mount a persistent volume at `/data`, set `ADMIN_TOKEN` to a new random secret of at least 32 characters, and set `DATA_DIR=/data`. Generate a public HTTPS domain. Keep one replica and disable serverless sleeping so connectors remain responsive. Configure volume ownership for the container's `node` user (UID 1000); Railway mounts can require `RAILWAY_RUN_UID=0` if ownership cannot be changed.
 
-The service binds `0.0.0.0` and uses Railway's `PORT`. `/healthz` is the public health endpoint. SQLite metadata, uploads, and online database backups live on the volume. Daily SQLite backups retain seven snapshots; they do not independently back up attachment bytes. Enable Railway volume backups to protect both. Volume deployment requires brief downtime; clients reconnect automatically.
+The service binds `0.0.0.0` and uses Railway's `PORT`. `/healthz` is the public health endpoint. SQLite metadata, uploads, and online database backups live on the volume. Daily SQLite backups retain seven snapshots; they do not independently back up attachment bytes. Railway full-volume backups, including attachment bytes, require the Pro plan. They are not enabled on the initial deployment's existing plan; the service's daily SQLite backups remain active. Volume deployment requires brief downtime; clients reconnect automatically.
 
 For CLI deployment after `npx @railway/cli login`, use `railway init`, add the service and volume, set variables, apply the infrastructure configuration, then run `railway up` and `railway domain`. The Railway CLI can upload this checkout without GitHub integration. Alternatively connect the service to `henry-md/agent-bridge` on GitHub.
 
