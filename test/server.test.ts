@@ -73,6 +73,8 @@ test('mailbox polling wakes, cursors paginate and retries do not duplicate messa
 });
 
 test('requests reject offline devices and enforce target ownership, lease fencing and idempotency', async t => {
+  // Database operations are slower on Windows CI; advance only the logical clock.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const { app, register, heartbeat } = await fixture(t, { leaseMs: 40 });
   const sender = await register('laptop');
   const receiver = await register('vm');
@@ -92,7 +94,7 @@ test('requests reject offline devices and enforce target ownership, lease fencin
   assert.deepEqual(await claim(), []);
   const result = (token: string, who = receiver) => app.inject({ method: 'POST', url: `/v1/requests/${id}/result`, headers: authorization(who), payload: { lease_token: token, result: { content: 'remote contents' } } });
   assert.equal((await result(original.lease_token, sender)).statusCode, 403);
-  await delay(60);
+  t.mock.timers.tick(60);
   assert.equal((await result(original.lease_token)).statusCode, 409);
   const replacement = (await claim())[0];
   assert.notEqual(replacement.lease_token, original.lease_token);
