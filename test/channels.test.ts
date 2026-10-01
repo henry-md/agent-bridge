@@ -202,7 +202,7 @@ test('idle channel reads avoid SQLite writes and renew durably at the lease cade
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const f = await fixture(t); const token = await f.register('first'); const member = await f.joinChannel(token);
   const inspect = new DatabaseSync(join(f.dataDir, 'bridge.sqlite'), { readOnly: true });
-  t.after(() => inspect.close());
+  try {
   const version = () => inspect.prepare('PRAGMA data_version').get()!.data_version;
   const lease = () => (inspect.prepare('SELECT lease_until FROM channel_members WHERE generation = ? AND session_id = ?').get(member.generation, member.session_id) as { lease_until: number }).lease_until;
   const initialVersion = version(); const initialLease = lease();
@@ -215,6 +215,7 @@ test('idle channel reads avoid SQLite writes and renew durably at the lease cade
   assert.equal(Date.parse(renewed.lease_expires_at), lease(), 'Status reports the lease actually committed to SQLite');
   const afterRenewal = version(); await f.inbox(token, member);
   assert.equal(version(), afterRenewal, 'An immediate repeat read must not commit again');
+  } finally { inspect.close(); }
 });
 
 test('lease expiry and leave remove connected state, require new acknowledgment and reset dead round words', async t => {
