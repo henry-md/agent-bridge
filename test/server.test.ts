@@ -131,10 +131,12 @@ test('SQLite preserves device credentials, pending requests, messages and files 
   assert.equal(upload.statusCode, 200, upload.body);
   await app.close();
   const restarted = await createServer({ dataDir, adminToken });
-  t.after(() => restarted.close());
-  assert.equal((await restarted.inject({ url: '/v1/messages', headers: authorization(receiver) })).json().messages[0].id, message.json().message.id);
-  assert.equal((await restarted.inject({ url: '/v1/connector/requests', headers: authorization(receiver) })).json().requests[0].id, request.json().request.id);
-  assert.equal((await restarted.inject({ url: `/v1/files/${upload.json().file.id}/content`, headers: authorization(receiver) })).body, 'persistent bytes');
+  // Close the reopened database before fixture cleanup; Windows will not unlink an open WAL.
+  try {
+    assert.equal((await restarted.inject({ url: '/v1/messages', headers: authorization(receiver) })).json().messages[0].id, message.json().message.id);
+    assert.equal((await restarted.inject({ url: '/v1/connector/requests', headers: authorization(receiver) })).json().requests[0].id, request.json().request.id);
+    assert.equal((await restarted.inject({ url: `/v1/files/${upload.json().file.id}/content`, headers: authorization(receiver) })).body, 'persistent bytes');
+  } finally { await restarted.close(); }
 });
 
 test('uploads stream exact bytes, enforce quota and limits, and restrict deletion to uploader', async t => {
