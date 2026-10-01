@@ -211,23 +211,46 @@ test('lease expiry and leave remove connected state, require new acknowledgment 
 });
 
 test('long polls wake for a real peer and messages, and renew the polling member lease', async t => {
+  // SQLite commits can take longer than this short lease on Windows. Advance
+  // only lease time; the server's polling timers still run on the real clock.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const f = await fixture(t, { channelLeaseMs: 120 });
   const first = await f.register('first');
   const second = await f.register('second');
   const a = await f.joinChannel(first);
-  const peerPoll = f.app.inject({ url: `/v1/channels/4040?${f.query(a)}&wait=1`, headers: auth(first) });
-  await delay(180);
-  const b = await f.joinChannel(second);
-  const seen = await peerPoll;
-  assert.equal(seen.statusCode, 200, seen.body);
-  assert.equal(seen.json().generation, a.generation, 'long poll keeps its session alive');
-  assert.deepEqual(seen.json().peer, { device: 'second', session_id: b.session_id });
-  await f.confirm(first, a);
-  await f.confirm(second, b);
-  const pending = f.app.inject({ url: `/v1/channels/4040/messages?${f.query(b)}&wait=1`, headers: auth(second) });
-  await delay(30);
-  assert.equal((await f.send(first, a, 'wake-up')).statusCode, 200);
-  assert.equal((await pending).json().messages[0].text, 'wake-up');
+  const inspect = new DatabaseSync(join(f.dataDir, 'bridge.sqlite'), { readOnly: true });
+  const renewedAfter = async (previous: number) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const member = inspect.prepare('SELECT lease_until FROM channel_members WHERE generation = ? AND session_id = ?')
+        .get(a.generation, a.session_id) as { lease_until: number };
+      if (member.lease_until > previous) return member.lease_until;
+      await delay(10);
+    }
+    assert.fail('The pending status poll did not renew its session lease');
+  };
+  try {
+    let settled = false;
+    const peerPoll = f.app.inject({ url: `/v1/channels/4040?${f.query(a)}&wait=1`, headers: auth(first) })
+      .then(response => { settled = true; return response; });
+    const originalExpiry = Date.parse(a.lease_expires_at);
+    t.mock.timers.tick(80);
+    const firstRenewal = await renewedAfter(originalExpiry);
+    t.mock.timers.tick(80);
+    await renewedAfter(firstRenewal);
+    assert.ok(Date.now() > originalExpiry, 'renewal is proven beyond the original lease expiry');
+    assert.equal(settled, false, 'the lease was renewed while the poll remained pending');
+    const b = await f.joinChannel(second);
+    const seen = await peerPoll;
+    assert.equal(seen.statusCode, 200, seen.body);
+    assert.equal(seen.json().generation, a.generation, 'long poll keeps its session alive');
+    assert.deepEqual(seen.json().peer, { device: 'second', session_id: b.session_id });
+    await f.confirm(first, a);
+    await f.confirm(second, b);
+    const pending = f.app.inject({ url: `/v1/channels/4040/messages?${f.query(b)}&wait=1`, headers: auth(second) });
+    await delay(30);
+    assert.equal((await f.send(first, a, 'wake-up')).statusCode, 200);
+    assert.equal((await pending).json().messages[0].text, 'wake-up');
+  } finally { inspect.close(); }
 });
 
 test('a status poll waits with the same unconfirmed peer and wakes on mutual confirmation', async t => {
