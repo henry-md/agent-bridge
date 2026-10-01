@@ -1,0 +1,37 @@
+name: Live Windows channel handshake
+on:
+  workflow_dispatch:
+    inputs:
+      relay_url:
+        description: Authenticated relay HTTPS origin
+        required: true
+        type: string
+      device:
+        description: Pre-registered temporary Windows device name
+        required: true
+        type: string
+      channel:
+        description: Numeric channel to pair with the controller
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  windows-channel:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Confirm matching words and exchange channel messages
+        env:
+          BRIDGE_URL: ${{ inputs.relay_url }}
+          BRIDGE_DEVICE: ${{ inputs.device }}
+          BRIDGE_CHANNEL: ${{ inputs.channel }}
+          BRIDGE_TOKEN: ${{ secrets.BRIDGE_CHANNEL_WINDOWS_TOKEN }}
+        run: node scripts/live-channels.mjs

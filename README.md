@@ -21,6 +21,34 @@ npx @railway/cli run --service agent-bridge -- node dist/cli.js register laptop
 
 Then select a shared root, install the skill into your participating project, and run `bridge connect` as shown below. Other computers need their own registered token and selected folders.
 
+## Pair two Codex chats on a channel
+
+After one-time device registration, install the skill on both computers with `bridge skill install --user`. In each active Codex chat, run:
+
+```text
+/agent-bridge 4040
+```
+
+The first participant proposes a random readable word. When both sessions have acknowledged that word, both agents report `Connected on channel 4040. Secret word is WORD.` A lone participant reports waiting. Enabled skills appear in Codex Desktop's slash command list; `$agent-bridge 4040` also invokes the skill. Use another number, such as `4041`, for another simultaneous conversation. These are logical channels through the same Railway HTTPS origin.
+
+The underlying CLI is:
+
+```sh
+bridge channel join 4040 --wait 25
+bridge send --channel 4040 --text 'Please inspect the VM export.'
+bridge inbox --channel 4040 --wait 25
+# Process the inbox page before acknowledging its returned cursor.
+bridge channel ack 4040 CURSOR
+bridge channel status 4040
+bridge channel leave 4040
+```
+
+Codex thread IDs identify separate sessions; other shells use a saved fallback ID per channel. Supply `--session UUID` consistently when running distinct agents that share an environment. There is no global active-channel setting. The relay allows two active sessions from different registered devices per channel and keeps channel messages separate from ordinary device mailboxes. One computer can participate in many different channel numbers concurrently.
+
+Inbox reads leave channel messages unacknowledged until `channel ack`; explicit `--after 0` replays the current round. Sessions have a 90-second activity lease, renewed by channel calls. After both expire, joining starts a fresh pairing with a new generation and word. A new peer must acknowledge a fresh handshake; an old word alone cannot prove an active peer. The word is a visual connection check, and bearer tokens still control access. Attachments retain the existing trusted-workspace access model.
+
+A file connector is needed for remote folder reads, but channel pairing and messages work without it. The skill does not wake idle Codex chats or launch agents automatically.
+
 ## Build and run locally
 
 Requires Node.js 24 or newer on each computer. Clone this repo, then:

@@ -25,3 +25,21 @@ Message and file-context submissions accept `Idempotency-Key`. Repeating a key w
 `wait` is bounded to 25 seconds. Inbox reads do not delete messages. Remote request states are `pending`, `running`, `completed`, `failed`, or `expired`. Result submission requires the current lease token and target identity; file requests expire after 60 seconds. An offline target returns a clear error rather than pretending context was available.
 
 Remote context paths are relative to a target's named shared root. Absolute host paths are not exposed in results. Text reads return source device, root, path, mtime, byte size, UTF-8 content, and `truncated`. A binary file must be explicitly uploaded as an attachment. No endpoint executes shell commands or modifies a shared folder.
+
+## Numbered channels
+
+Channel IDs are canonical nonnegative decimal strings (up to 64 digits); sessions and generations are UUIDs. IDs are stored as strings, so they are independent of TCP port limits and JavaScript integer precision. Every route below requires an authenticated device. A session is bound to its device, channel, and generation.
+
+| Method and path | Purpose / body |
+| --- | --- |
+| `POST /v1/channels/:channel/join` | `{session_id, secret_word}`; joins or renews a two-session pairing |
+| `GET /v1/channels/:channel` | Query `session_id`, `generation`, `wait`; waits for handshake status |
+| `POST /v1/channels/:channel/confirm` | `{session_id, generation, pairing_id, secret_word}`; acknowledges the current shared word and peer pairing |
+| `DELETE /v1/channels/:channel/sessions/:session_id` | Query `generation` and `pairing_id`; leaves this session |
+| `POST /v1/channels/:channel/messages` | `{session_id, generation, text, file_ids}`; sends to the paired session, supports `Idempotency-Key` |
+| `GET /v1/channels/:channel/messages` | Query `session_id`, `generation`, optional `after`, `wait`; returns `{messages, cursor, acknowledged_cursor}` |
+| `POST /v1/channels/:channel/ack` | `{session_id, generation, cursor}`; advances only this recipient's acknowledged cursor |
+
+Join, confirm, and status return `{channel, generation, pairing_id, session_id, secret_word, status, peer, lease_expires_at}`. `status` is `waiting` until two active sessions acknowledge the same word, then `connected`. `peer` is `{device, session_id}` or `null`. New or replacement peers invalidate earlier confirmations and change `pairing_id`, including a peer returning with the same session ID. Delayed confirmations and active leave requests for an earlier pairing are rejected. Repeating an already-completed leave remains harmless. Activity leases last 90 seconds by default; joining an empty expired channel creates a fresh generation. Device revocation invalidates channel access too.
+
+Channel messages include `id`, `seq`, `channel`, `generation`, `from`, `from_session`, `to`, `to_session`, `text`, `file_ids`, and `created_at`. They use a separate mailbox from legacy device messages. Acknowledgment is explicit and monotonic; ordinary polling resumes from the persisted acknowledged cursor. Explicit `after` is for replay and does not acknowledge delivery. Generation fencing prevents stale sessions from sending or acknowledging a later pairing. Channel numbers and words are identifiers and confirmation material, not credentials.
