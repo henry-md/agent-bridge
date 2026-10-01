@@ -1,0 +1,37 @@
+name: Live Windows bridge smoke test
+on:
+  workflow_dispatch:
+    inputs:
+      relay_url:
+        description: Authenticated relay HTTPS origin
+        required: true
+        type: string
+      device:
+        description: Pre-registered Windows device name
+        required: true
+        type: string
+      peer:
+        description: Pre-registered controller device name
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  windows-connector:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Exercise real HTTPS messages and binary transfers
+        env:
+          BRIDGE_URL: ${{ inputs.relay_url }}
+          BRIDGE_DEVICE: ${{ inputs.device }}
+          BRIDGE_PEER: ${{ inputs.peer }}
+          BRIDGE_TOKEN: ${{ secrets.BRIDGE_WINDOWS_TOKEN }}
+        run: node scripts/live-windows.mjs
