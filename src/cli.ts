@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { copyFile, mkdir, realpath, stat } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { cp, lstat, mkdir, realpath, rename, rm, stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { BridgeError, messageInputSchema, nameSchema, requestInputSchema } from './shared/protocol.js';
+import { BridgeError, channelMessageInputSchema, messageInputSchema, nameSchema, requestInputSchema } from './shared/protocol.js';
 import { configPath, readConfig, tokenFromEnv, updateConfig, type BridgeConfig } from './client/config.js';
 import { RelayClient, validateRelayUrl } from './client/relay.js';
 import { runConnector } from './client/connector.js';
+import { channelId, channelResult, channelStatus, joinChannel, leaveChannel, requireChannelSession } from './client/channel.js';
 
 const program = new Command().name('bridge').description('Exchange messages and file context through your private Railway relay').version('0.1.0');
 program.configureOutput({ outputError: () => {} });
@@ -23,6 +25,7 @@ configuration.command('set').requiredOption('--url <url>', 'Relay HTTPS origin')
   const token = options.tokenEnv ? tokenFromEnv(options.tokenEnv) : undefined;
   const config = await updateConfig(old => {
     const next: BridgeConfig = old?.url === url ? { ...old } : { url, roots: {} };
+    if ((token && token !== next.token) || (device && device !== next.device)) delete next.channel_sessions;
     if (token) { next.token = token; next.inbox_cursor = 0; }
     if (device) next.device = device;
     return next;
@@ -32,7 +35,7 @@ configuration.command('set').requiredOption('--url <url>', 'Relay HTTPS origin')
 configuration.command('show').action(async () => { const config = await readConfig(false); output({ ...config, token: config.token ? '[REDACTED]' : undefined }); });
 program.command('register').argument('<name>').option('--token-env <variable>', 'Environment variable holding admin token', 'ADMIN_TOKEN').action(async (name, options) => {
   nameSchema.parse(name); const config = await readConfig(false); const client = new RelayClient(config.url, tokenFromEnv(options.tokenEnv)); const registration = await client.register(name);
-  await updateConfig(current => { if (!current || current.url !== config.url) throw new BridgeError(0, 'CONFIG_CHANGED', 'Relay configuration changed during registration'); return { ...current, device: name, token: registration.token, inbox_cursor: 0 }; }); output({ device: registration.device, token_saved: true });
+  await updateConfig(current => { if (!current || current.url !== config.url || current.token !== config.token || current.device !== config.device) throw new BridgeError(0, 'CONFIG_CHANGED', 'Relay configuration changed during registration'); const next = { ...current, device: name, token: registration.token, inbox_cursor: 0 }; delete next.channel_sessions; return next; }); output({ device: registration.device, token_saved: true });
 });
 program.command('revoke').argument('<name>').option('--token-env <variable>', 'Environment variable holding admin token', 'ADMIN_TOKEN').action(async (name, options) => { nameSchema.parse(name); const config = await readConfig(false); output(await new RelayClient(config.url, tokenFromEnv(options.tokenEnv)).revoke(name)); });
 const roots = program.command('root').description('Allow read-only access to an explicit folder alias');
@@ -60,11 +63,32 @@ for (const operation of ['read', 'list', 'search'] as const) {
     else throw new BridgeError(0, request.error?.code ?? 'REQUEST_TIMEOUT', request.error?.message ?? `Remote request ${request.id} did not complete`);
   });
 }
-program.command('send').requiredOption('--to <device>').option('--text <text>', 'Message text', '').option('--attach <file-id>', 'Attach file ID; repeat for multiple files', (value: string, previous: string[]) => [...previous, value], [] as string[]).option('--idempotency-key <key>').action(async options => {
-  const { client } = await localClient(); const input = messageInputSchema.parse({ to: options.to, text: options.text, file_ids: options.attach }); output({ message: await client.send(input, options.idempotencyKey) });
+const channels = program.command('channel').description('Pair two chat sessions on a numeric channel');
+channels.command('join').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID; defaults to CODEX_THREAD_ID or a saved per-channel UUID').option('--wait <seconds>', 'Wait for the mutual handshake, 0–25 seconds', wait, 25).action(async (channel, options) => {
+  const { config, client } = await localClient(); output(channelResult(await joinChannel(client, config, channel, options.session, options.wait)));
 });
-program.command('inbox').option('--wait <seconds>', 'Long poll wait, 0–25 seconds', wait, 25).option('--after <cursor>', 'Override saved cursor for this call', integer).action(async options => {
-  const { config, client } = await localClient(); const after = options.after ?? config.inbox_cursor ?? 0; const page = await client.inbox(after, options.wait);
+channels.command('status').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').option('--wait <seconds>', 'Long poll wait, 0–25 seconds', wait, 0).action(async (channel, options) => {
+  const { config, client } = await localClient(); output(channelResult(await channelStatus(client, config, channel, options.session, options.wait)));
+});
+channels.command('leave').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').action(async (channel, options) => {
+  const { config, client } = await localClient(); const session = await leaveChannel(client, config, channel, options.session); output({ left: true, channel: session.channel, session_id: session.session_id, generation: session.generation });
+});
+channels.command('ack').argument('<channel>', 'Canonical numeric channel', channelId).argument('<cursor>', 'Inbox cursor processed successfully', integer).option('--session <uuid>', 'Chat session UUID').action(async (channel, cursor, options) => {
+  const { config, client } = await localClient(); const session = requireChannelSession(config, channel, options.session); output(await client.acknowledgeChannel(session.channel, session.session_id, session.generation, cursor));
+});
+program.command('send').option('--to <device>', 'Recipient for the device mailbox').option('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID for --channel').option('--text <text>', 'Message text', '').option('--attach <file-id>', 'Attach file ID; repeat for multiple files', (value: string, previous: string[]) => [...previous, value], [] as string[]).option('--idempotency-key <key>').action(async options => {
+  if (options.channel && options.to) throw new BridgeError(0, 'INVALID_ARGUMENT', '--channel and --to are mutually exclusive');
+  if (!options.channel && !options.to) throw new BridgeError(0, 'INVALID_ARGUMENT', 'Specify --channel or --to');
+  if (options.session && !options.channel) throw new BridgeError(0, 'INVALID_ARGUMENT', '--session requires --channel');
+  const { config, client } = await localClient();
+  if (options.channel) { const session = requireChannelSession(config, options.channel, options.session); const input = channelMessageInputSchema.parse({ session_id: session.session_id, generation: session.generation, text: options.text, file_ids: options.attach }); output({ message: await client.sendChannel(session.channel, input, options.idempotencyKey) }); }
+  else { const input = messageInputSchema.parse({ to: options.to, text: options.text, file_ids: options.attach }); output({ message: await client.send(input, options.idempotencyKey) }); }
+});
+program.command('inbox').option('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID for --channel').option('--wait <seconds>', 'Long poll wait, 0–25 seconds', wait, 25).option('--after <cursor>', 'Replay after this cursor for this call', integer).action(async options => {
+  if (options.session && !options.channel) throw new BridgeError(0, 'INVALID_ARGUMENT', '--session requires --channel');
+  const { config, client } = await localClient();
+  if (options.channel) { const session = requireChannelSession(config, options.channel, options.session); output(await client.channelInbox(session.channel, session.session_id, session.generation, options.after, options.wait)); return; }
+  const after = options.after ?? config.inbox_cursor ?? 0; const page = await client.inbox(after, options.wait);
   output(page);
   if (options.after === undefined && page.cursor > (config.inbox_cursor ?? 0)) await updateConfig(current => {
     if (!current) throw new BridgeError(0, 'CONFIG_CHANGED', 'Configuration was removed during inbox polling');
@@ -77,12 +101,29 @@ program.command('download').argument('<id>').requiredOption('--output <path>', '
 program.command('files').action(async () => { const { client } = await localClient(); output({ files: await client.files() }); });
 program.command('file').argument('<id>').action(async id => { const { client } = await localClient(); output({ file: await client.file(id) }); });
 program.command('delete').argument('<id>').action(async id => { const { client } = await localClient(); output(await client.deleteFile(id)); });
-program.command('skill').command('install').requiredOption('--project <path>', 'Project checkout').option('--force', 'Replace an existing skill').action(async options => {
-  const project = await realpath(resolve(options.project)); if (!(await stat(project)).isDirectory()) throw new BridgeError(0, 'NOT_A_DIRECTORY', 'Project must be a directory');
-  const destination = resolve(project, '.agents/skills/agent-bridge/SKILL.md'); await mkdir(dirname(destination), { recursive: true });
-  const source = resolve(dirname(fileURLToPath(import.meta.url)), '../.agents/skills/agent-bridge/SKILL.md');
-  try { await copyFile(source, destination, options.force ? 0 : constants.COPYFILE_EXCL); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new BridgeError(0, 'SKILL_EXISTS', 'Skill already exists; use --force to replace it'); throw error; }
-  output({ installed: destination });
+program.command('skill').command('install').option('--project <path>', 'Install inside a project checkout').option('--user', 'Install for this user (default)').option('--force', 'Replace an existing skill folder').action(async options => {
+  if (options.project && options.user) throw new BridgeError(0, 'INVALID_ARGUMENT', '--user and --project are mutually exclusive');
+  let destination: string;
+  if (options.project) { const project = await realpath(resolve(options.project)); if (!(await stat(project)).isDirectory()) throw new BridgeError(0, 'NOT_A_DIRECTORY', 'Project must be a directory'); destination = resolve(project, '.agents/skills/agent-bridge'); }
+  else destination = resolve(homedir(), '.codex/skills/agent-bridge');
+  const source = resolve(dirname(fileURLToPath(import.meta.url)), '../.agents/skills/agent-bridge');
+  await mkdir(dirname(destination), { recursive: true });
+  const staging = `${destination}.${randomUUID()}.tmp`; const backup = `${destination}.${randomUUID()}.backup`;
+  let reserved = false; let backedUp = false;
+  try {
+    await cp(source, staging, { recursive: true, force: false, errorOnExist: true });
+    if (options.force) {
+      try { await lstat(destination); await rename(destination, backup); backedUp = true; } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    }
+    try { await mkdir(destination); reserved = true; } catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new BridgeError(0, 'SKILL_EXISTS', 'Skill already exists; use --force to replace it'); throw error; }
+    await rename(staging, destination); reserved = false;
+    if (backedUp) { await rm(backup, { recursive: true, force: true }); backedUp = false; }
+  } catch (error) {
+    if (reserved) await rm(destination, { recursive: true, force: true });
+    if (backedUp) await rename(backup, destination);
+    throw error;
+  } finally { await rm(staging, { recursive: true, force: true }); }
+  output({ installed: resolve(destination, 'SKILL.md'), scope: options.project ? 'project' : 'user' });
 });
 try { await program.parseAsync(); } catch (error) {
   const commander = error as { code?: string; exitCode?: number };

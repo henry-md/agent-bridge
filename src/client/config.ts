@@ -2,10 +2,14 @@ import { chmod, mkdir, readFile, rename, writeFile, realpath, rm } from 'node:fs
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { BridgeError, nameSchema } from '../shared/protocol.js';
+import { z } from 'zod';
+import { BridgeError, channelIdSchema, nameSchema } from '../shared/protocol.js';
 import { validateRelayUrl } from './relay.js';
 
-export interface BridgeConfig { url: string; token?: string; device?: string; roots: Record<string, string>; inbox_cursor?: number }
+export interface ChannelSessionConfig { generation?: string; secret_word: string }
+export interface ChannelConfig { fallback_session_id?: string; sessions: Record<string, ChannelSessionConfig> }
+export interface BridgeConfig { url: string; token?: string; device?: string; roots: Record<string, string>; inbox_cursor?: number; channel_sessions?: Record<string, ChannelConfig> }
+const channelSessionsSchema = z.record(channelIdSchema, z.object({ fallback_session_id: z.string().uuid().optional(), sessions: z.record(z.string().uuid(), z.object({ generation: z.string().uuid().optional(), secret_word: z.string().regex(/^[a-z0-9-]{3,80}$/) }).strict()) }).strict());
 export function configPath(): string { return resolve(process.env.BRIDGE_CONFIG ?? `${homedir()}/.agent-bridge/config.json`); }
 export async function readConfig(requireToken = true): Promise<BridgeConfig> {
   let config: BridgeConfig;
@@ -17,6 +21,7 @@ export async function readConfig(requireToken = true): Promise<BridgeConfig> {
   if (requireToken && !config.token) throw new BridgeError(0, 'TOKEN_REQUIRED', 'Configuration needs a device token');
   if (!config.roots || typeof config.roots !== 'object' || Array.isArray(config.roots) || Object.entries(config.roots).some(([alias, path]) => !nameSchema.safeParse(alias).success || typeof path !== 'string' || !isAbsolute(path))) throw new BridgeError(0, 'CONFIG_INVALID', 'Configured roots must have valid aliases and absolute paths');
   if (config.device && !nameSchema.safeParse(config.device).success) throw new BridgeError(0, 'CONFIG_INVALID', 'Configured device name is invalid');
+  if (config.channel_sessions !== undefined && !channelSessionsSchema.safeParse(config.channel_sessions).success) throw new BridgeError(0, 'CONFIG_INVALID', 'Saved channel sessions are invalid');
   return config;
 }
 async function saveConfig(config: BridgeConfig): Promise<void> {

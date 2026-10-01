@@ -1,0 +1,4 @@
+interface:
+  display_name: "agent-bridge"
+  short_description: "Pair agents on a numbered channel with a shared word"
+  default_prompt: "Use $agent-bridge to connect on channel 4040 and confirm the shared secret word."
