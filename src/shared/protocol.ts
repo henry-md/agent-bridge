@@ -44,7 +44,7 @@ export interface ChannelMessage {
   from: string; from_session: string; to: string; to_session: string;
   text: string; file_ids: string[]; created_at: string;
 }
-export interface ChannelInbox { messages: ChannelMessage[]; cursor: number; acknowledged_cursor: number }
+export interface ChannelInbox { messages: ChannelMessage[]; cursor: number; acknowledged_cursor: number; connection?: ChannelStatus }
 export interface Device { name: string; roots: string[]; last_seen: string | null; online: boolean; revoked: boolean }
 export interface Message extends MessageInput { id: string; seq: number; from: string; created_at: string }
 export interface FileInfo { id: string; name: string; size: number; sha256: string; content_type: string; uploaded_by: string; created_at: string }

@@ -92,9 +92,10 @@ export class RelayClient {
   async sendChannel(channel: string, input: ChannelMessageInput, idempotencyKey = randomUUID()) {
     return (await this.json<{ message: ChannelMessage }>(`/v1/channels/${encodeURIComponent(channel)}/messages`, 'POST', input, idempotencyKey)).message;
   }
-  async channelInbox(channel: string, sessionId: string, generation: string, after?: number, wait = 25) {
+  async channelInbox(channel: string, sessionId: string, generation: string, after?: number, wait = 25, connection = false) {
     const query = new URLSearchParams({ session_id: sessionId, generation, wait: String(wait) });
     if (after !== undefined) query.set('after', String(after));
+    if (connection) query.set('state', '1');
     return this.json<ChannelInbox>(`/v1/channels/${encodeURIComponent(channel)}/messages?${query}`);
   }
   async acknowledgeChannel(channel: string, sessionId: string, generation: string, cursor: number) {

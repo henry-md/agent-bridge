@@ -119,16 +119,26 @@ export async function watchChannel(client: RelayClient, config: BridgeConfig, ch
   const deadline = timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : Infinity;
   let session = requireChannelSession(config, channel, sessionId);
   let page: ChannelInbox | undefined; let needsRejoin = false; let failures = 0;
+  let legacyInbox = false;
   while (Date.now() < deadline) {
     try {
       if (needsRejoin) { session = await rejoin(client, config, session); needsRejoin = false; }
-      // A peer that rejoined or replaced its chat resets the pairing; confirm it so both sides can keep sending.
-      const status = await client.channelStatus(session.channel, session.session_id, session.generation, 0);
-      if (status.peer && status.status !== 'connected') await confirmStatus(client, status);
-      page = await client.channelInbox(session.channel, session.session_id, session.generation, undefined, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
+      // Current relays include the connection snapshot in the inbox poll, avoiding
+      // a separate status request before every receive. Older relays keep working.
+      if (legacyInbox) {
+        const status = await client.channelStatus(session.channel, session.session_id, session.generation, 0);
+        if (status.peer && status.status !== 'connected') await confirmStatus(client, status);
+      }
+      page = await client.channelInbox(session.channel, session.session_id, session.generation, undefined, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)), !legacyInbox);
+      if (!legacyInbox && !page.connection) {
+        legacyInbox = true;
+        if (!page.messages.length) continue;
+      }
+      if (page.connection?.peer && page.connection.status !== 'connected') await confirmStatus(client, page.connection);
       failures = 0;
       if (page.messages.length) return { ...page, channel: session.channel, session_id: session.session_id, timed_out: false };
     } catch (error) {
+      if (!legacyInbox && error instanceof BridgeError && error.status === 400 && error.code === 'invalid_input') { legacyInbox = true; continue; }
       if (error instanceof BridgeError && rejoinCodes.has(error.code)) { needsRejoin = true; continue; }
       if (!transientFailure(error)) throw error;
       failures++; await pause(Math.min(30_000, 1000 * 2 ** Math.min(failures, 5)));

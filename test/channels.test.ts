@@ -175,6 +175,29 @@ test('two channels isolate delivery, duplicate retries, durable acknowledgments 
   assert.equal((await f.app.inject({ url: '/v1/messages', headers: auth(second) })).json().messages.length, 0, 'legacy inbox is independent');
 });
 
+test('state inbox wakes for an unconfirmed peer and mutual confirmation, but keeps connected idle polls pending', { timeout: 10_000 }, async t => {
+  const f = await fixture(t); const first = await f.register('first'); const second = await f.register('second');
+  const a = await f.joinChannel(first); const b = await f.joinChannel(second);
+  const poll = () => f.app.inject({ url: `/v1/channels/4040/messages?${f.query(a)}&state=1&wait=25`, headers: auth(first) });
+  const unconfirmed = await Promise.race([poll(), delay(3000).then(() => { throw new Error('Already present unconfirmed peer must wake the inbox'); })]);
+  assert.equal(unconfirmed.statusCode, 200); assert.equal(unconfirmed.json().connection.status, 'waiting');
+  assert.equal(unconfirmed.json().connection.peer.session_id, b.session_id); assert.equal(unconfirmed.json().acknowledged_cursor, 0);
+  await f.confirm(first, a);
+  let settled = false;
+  const awaitingPeerConfirmation = poll().then(response => { settled = true; return response; });
+  await delay(50); assert.equal(settled, false, 'A locally confirmed peer must not produce an immediate empty inbox loop');
+  await f.confirm(second, b);
+  const connected = await awaitingPeerConfirmation;
+  assert.equal(connected.json().connection.status, 'connected'); assert.deepEqual(connected.json().messages, []);
+  settled = false;
+  const idle = poll().then(response => { settled = true; return response; });
+  await delay(50); assert.equal(settled, false, 'Connected alone must not terminate the long poll');
+  await f.send(second, b, 'wake connected poll');
+  const received = (await idle).json();
+  assert.equal(received.connection.status, 'connected'); assert.equal(received.messages[0].text, 'wake connected poll');
+  assert.equal(received.acknowledged_cursor, 0, 'Connection metadata must not acknowledge messages');
+});
+
 test('lease expiry and leave remove connected state, require new acknowledgment and reset dead round words', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const f = await fixture(t, { channelLeaseMs: 1000 });

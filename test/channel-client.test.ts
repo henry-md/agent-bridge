@@ -137,6 +137,43 @@ async function httpFixture(t: TestContext, handle: (req: IncomingMessage, res: S
   t.after(async () => { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); });
   return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 }
+test('watch receives current connection state and queued mail in one request without acknowledging', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-watch-state-')); t.after(() => rm(directory, { recursive: true, force: true }));
+  const session = randomUUID(); const generation = randomUUID(); const peer = randomUUID(); const requests: string[] = [];
+  const connection = { channel: '4040', generation, pairing_id: randomUUID(), session_id: session, secret_word: 'amber-river', status: 'connected', peer: { device: 'vm', session_id: peer }, lease_expires_at: new Date(Date.now() + 90_000).toISOString() };
+  const message = { id: randomUUID(), seq: 7, channel: '4040', generation, from: 'vm', from_session: peer, to: 'laptop', to_session: session, text: 'queued mail', file_ids: [], created_at: new Date().toISOString() };
+  const url = await httpFixture(t, (req, res) => {
+    requests.push(req.url!); const query = new URL(req.url!, 'http://localhost');
+    assert.equal(query.pathname, '/v1/channels/4040/messages'); assert.equal(query.searchParams.get('state'), '1');
+    res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ messages: [message], cursor: 7, acknowledged_cursor: 0, connection }));
+  });
+  const path = join(directory, 'config.json');
+  await writeFile(path, JSON.stringify({ url, token: 'token', device: 'laptop', roots: {}, channel_sessions: { '4040': { sessions: { [session]: { generation, secret_word: connection.secret_word } } } } }));
+  const result = await cli(path, ['watch', '--channel', '4040', '--timeout', '5'], session);
+  assert.deepEqual(result.messages, [message]); assert.equal(result.acknowledged_cursor, 0); assert.equal(requests.length, 1);
+});
+
+test('watch falls back to status plus inbox on older relays without losing queued mail', async t => {
+  for (const rejection of [true, false]) {
+    const directory = await mkdtemp(join(tmpdir(), 'bridge-watch-legacy-')); t.after(() => rm(directory, { recursive: true, force: true }));
+    const session = randomUUID(); const generation = randomUUID(); const requests: string[] = [];
+    const connection = { channel: '4040', generation, pairing_id: randomUUID(), session_id: session, secret_word: 'amber-river', status: 'connected', peer: { device: 'vm', session_id: randomUUID() }, lease_expires_at: new Date(Date.now() + 90_000).toISOString() };
+    const message = { id: randomUUID(), seq: 9, channel: '4040', generation, from: 'vm', from_session: connection.peer.session_id, to: 'laptop', to_session: session, text: 'legacy mail', file_ids: [], created_at: new Date().toISOString() };
+    const url = await httpFixture(t, (req, res) => {
+      const query = new URL(req.url!, 'http://localhost'); requests.push(query.pathname + (query.searchParams.has('state') ? '?state=1' : ''));
+      const state = query.searchParams.has('state');
+      if (state && rejection) { res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: { code: 'invalid_input', message: 'Unknown query' } })); return; }
+      const body = query.pathname.endsWith('/messages') ? { messages: [message], cursor: 9, acknowledged_cursor: 0 } : connection;
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
+    });
+    const path = join(directory, 'config.json');
+    await writeFile(path, JSON.stringify({ url, token: 'token', device: 'laptop', roots: {}, channel_sessions: { '4040': { sessions: { [session]: { generation, secret_word: connection.secret_word } } } } }));
+    const result = await cli(path, ['watch', '--channel', '4040', '--timeout', '5'], session);
+    assert.deepEqual(result.messages, [message]); assert.equal(result.acknowledged_cursor, 0);
+    assert.deepEqual(requests, rejection ? ['/v1/channels/4040/messages?state=1', '/v1/channels/4040', '/v1/channels/4040/messages'] : ['/v1/channels/4040/messages?state=1']);
+  }
+});
+
 test('CLI join retries preserve the exact secret candidate and idempotency key', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-channel-retry-')); t.after(() => rm(directory, { recursive: true, force: true }));
   const bodies: string[] = []; const keys: string[] = []; const generation = randomUUID();

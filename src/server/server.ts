@@ -38,7 +38,7 @@ const waitSchema = z.object({ wait: z.coerce.number().int().min(0).max(25).defau
 const messageQuerySchema = waitSchema.extend({ after: z.coerce.number().int().min(0).default(0) });
 const channelSessionSchema = z.object({ session_id: z.string().uuid(), generation: z.string().uuid() }).strict();
 const channelStatusQuerySchema = channelSessionSchema.extend({ wait: z.coerce.number().int().min(0).max(25).default(0) });
-const channelInboxQuerySchema = channelStatusQuerySchema.extend({ after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional() });
+const channelInboxQuerySchema = channelStatusQuerySchema.extend({ after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(), state: z.literal('1').optional() });
 const channelAckSchema = channelSessionSchema.extend({ cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER) });
 const resultSchema = z.object({
   lease_token: z.string().min(1).max(256),
@@ -410,18 +410,26 @@ export async function createServer(options: ServerOptions) {
     const who = actor(request);
     let initialPairing: string | undefined;
     let pairing: string | undefined;
+    let initialConnection: ChannelStatus['status'] | undefined;
+    let needsConfirmation = false;
     return poll(request, reply, input.wait, () => transaction(() => {
       const now = Date.now();
       const round = channelRound(channel, input.generation);
       expireChannelMembers(round, now);
       const member = channelMember(round, input.session_id, who, now);
       pairing = round.pairing_id;
+      const connection = input.state ? channelStatus(round, member, now) : undefined;
+      needsConfirmation = !!connection?.peer && member.confirmed_peer_session !== connection.peer.session_id;
       const after = input.after ?? member.acknowledged_cursor;
       const rows = db.prepare('SELECT * FROM channel_messages WHERE generation = ? AND to_name = ? AND to_session = ? AND seq > ? ORDER BY seq LIMIT 100')
         .all(input.generation, who.name, input.session_id, after) as Row[];
-      return { messages: rows.map(channelMessageInfo), cursor: rows.at(-1)?.seq ?? after, acknowledged_cursor: member.acknowledged_cursor };
+      return { messages: rows.map(channelMessageInfo), cursor: rows.at(-1)?.seq ?? after, acknowledged_cursor: member.acknowledged_cursor, ...(connection ? { connection } : {}) };
     }), value => {
       initialPairing ??= pairing;
+      if (input.state) {
+        initialConnection ??= value.connection!.status;
+        if (needsConfirmation || value.connection!.status !== initialConnection) return true;
+      }
       // Return early when the pairing resets so a watching reader can confirm the new peer promptly.
       return value.messages.length > 0 || pairing !== initialPairing;
     }, Math.max(1, Math.min(250, Math.floor(channelLeaseMs / 3))));
