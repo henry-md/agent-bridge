@@ -211,6 +211,24 @@ test('watch deadline cancels stalled HTTP requests and recovery backoff', { time
   }
 });
 
+test('watch delivers received mail before a stalled reconfirmation and rejects overflowing timeouts', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-watch-mail-deadline-')); t.after(() => rm(directory, { recursive: true, force: true }));
+  const session = randomUUID(); const generation = randomUUID(); let requests = 0;
+  const connection = { channel: '4040', generation, pairing_id: randomUUID(), session_id: session, secret_word: 'amber-river', status: 'waiting', peer: { device: 'vm', session_id: randomUUID() }, lease_expires_at: new Date(Date.now() + 90_000).toISOString() };
+  const url = await httpFixture(t, (req, res) => {
+    requests++; if (req.url?.endsWith('/confirm')) return;
+    res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ messages: [{ text: 'keep this mail' }], cursor: 7, acknowledged_cursor: 0, connection }));
+  });
+  const path = join(directory, 'config.json');
+  await writeFile(path, JSON.stringify({ url, token: 'token', device: 'laptop', roots: {}, channel_sessions: { '4040': { sessions: { [session]: { generation, secret_word: connection.secret_word } } } } }));
+  const result = await cli(path, ['watch', '--channel', '4040', '--timeout', '1'], session);
+  assert.equal(result.messages[0].text, 'keep this mail'); assert.equal(result.timed_out, false); assert.equal(result.acknowledged_cursor, 0);
+  assert.equal(requests, 1, 'Queued mail should not await a redundant confirmation request');
+  requests = 0;
+  await assert.rejects(cli(path, ['watch', '--channel', '4040', '--timeout', '2147484'], session), (error: unknown) => (error as { stderr: string }).stderr.includes('INVALID_ARGUMENT'));
+  assert.equal(requests, 0);
+});
+
 test('CLI join retries preserve the exact secret candidate and idempotency key', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-channel-retry-')); t.after(() => rm(directory, { recursive: true, force: true }));
   const bodies: string[] = []; const keys: string[] = []; const generation = randomUUID();

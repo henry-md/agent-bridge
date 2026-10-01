@@ -115,12 +115,18 @@ async function rejoin(client: RelayClient, config: BridgeConfig, session: LocalC
   return requireChannelSession(await readConfig(), session.channel, session.session_id);
 }
 export interface WatchResult extends ChannelInbox { channel: string; session_id: string; timed_out: boolean }
+export const MAX_CHANNEL_TIMEOUT_SECONDS = 2_147_483;
+export function validateChannelTimeout(seconds: number): number {
+  if (!Number.isFinite(seconds) || seconds < 0 || seconds > MAX_CHANNEL_TIMEOUT_SECONDS) throw new BridgeError(0, 'INVALID_ARGUMENT', `Timeout must be between 0 and ${MAX_CHANNEL_TIMEOUT_SECONDS} seconds`);
+  return seconds;
+}
 export async function watchChannel(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string, timeoutSeconds = 0): Promise<WatchResult> {
+  validateChannelTimeout(timeoutSeconds);
+  let session = requireChannelSession(config, channel, sessionId);
   const deadline = timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : Infinity;
   const controller = new AbortController();
   const timer = timeoutSeconds > 0 ? setTimeout(() => controller.abort(), timeoutSeconds * 1000) : undefined;
   timer?.unref(); const signal = controller.signal;
-  let session = requireChannelSession(config, channel, sessionId);
   let page: ChannelInbox | undefined; let needsRejoin = false; let failures = 0;
   let legacyInbox = false;
   try { while (Date.now() < deadline && !signal.aborted) {
@@ -137,9 +143,11 @@ export async function watchChannel(client: RelayClient, config: BridgeConfig, ch
         legacyInbox = true;
         if (!page.messages.length) continue;
       }
+      // Already authorized mail should reach the agent immediately. The next
+      // empty watch (or send) reconfirms a replacement peer without delaying it.
+      if (page.messages.length) return { ...page, channel: session.channel, session_id: session.session_id, timed_out: false };
       if (page.connection?.peer && page.connection.status !== 'connected') await confirmStatus(client, page.connection, signal);
       failures = 0;
-      if (page.messages.length) return { ...page, channel: session.channel, session_id: session.session_id, timed_out: false };
     } catch (error) {
       if (signal.aborted) break;
       if (!legacyInbox && error instanceof BridgeError && error.status === 400 && error.code === 'invalid_input') { legacyInbox = true; continue; }

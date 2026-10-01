@@ -9,7 +9,7 @@ import { BridgeError, messageInputSchema, nameSchema, requestInputSchema } from 
 import { configPath, readConfig, tokenFromEnv, updateConfig, type BridgeConfig } from './client/config.js';
 import { RelayClient, validateRelayUrl } from './client/relay.js';
 import { runConnector } from './client/connector.js';
-import { channelId, channelResult, channelStatus, joinChannel, leaveChannel, requireChannelSession, sendChannelMessage, watchChannel } from './client/channel.js';
+import { channelId, channelResult, channelStatus, joinChannel, leaveChannel, requireChannelSession, sendChannelMessage, validateChannelTimeout, watchChannel } from './client/channel.js';
 
 const program = new Command().name('bridge').description('Exchange messages and file context through your private Railway relay').version('0.1.0');
 program.configureOutput({ outputError: () => {} });
@@ -17,6 +17,7 @@ program.exitOverride();
 const output = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const integer = (raw: string) => { const value = Number(raw); if (!Number.isSafeInteger(value) || value < 0) throw new BridgeError(0, 'INVALID_ARGUMENT', 'Expected a nonnegative integer'); return value; };
 const wait = (raw: string) => { const value = integer(raw); if (value > 25) throw new BridgeError(0, 'INVALID_ARGUMENT', 'Wait must be between 0 and 25 seconds'); return value; };
+const channelTimeout = (raw: string) => validateChannelTimeout(integer(raw));
 async function localClient() { const config = await readConfig(); return { config, client: new RelayClient(config.url, config.token!) }; }
 const configuration = program.command('config').description('Configure local credentials outside Git');
 configuration.command('set').requiredOption('--url <url>', 'Relay HTTPS origin').option('--token-env <variable>', 'Environment variable holding a device token').option('--device <name>', 'Device name').action(async options => {
@@ -96,7 +97,7 @@ program.command('inbox').option('--channel <channel>', 'Paired numeric channel',
     return { ...current, inbox_cursor: Math.max(current.inbox_cursor ?? 0, page.cursor) };
   });
 });
-program.command('watch').description('Wait for the next channel messages, rejoining and reconfirming as needed; exits once messages arrive').requiredOption('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').option('--timeout <seconds>', 'Give up after this many seconds; 0 waits indefinitely', integer, 0).action(async options => {
+program.command('watch').description('Wait for the next channel messages, rejoining and reconfirming as needed; exits once messages arrive').requiredOption('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').option('--timeout <seconds>', 'Give up after this many seconds; 0 waits indefinitely', channelTimeout, 0).action(async options => {
   const { config, client } = await localClient(); output(await watchChannel(client, config, options.channel, options.session, options.timeout));
 });
 program.command('upload').argument('<path>').action(async path => { const { client } = await localClient(); output({ file: await client.upload(path) }); });
