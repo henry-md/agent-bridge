@@ -29,7 +29,7 @@ After one-time device registration, install the skill on both computers: `bridge
 /agent-bridge 4040
 ```
 
-The first participant proposes a random readable word. When both sessions have acknowledged that word, both agents report `Connected on channel 4040. Secret word is WORD.` A lone participant reports waiting. Enabled skills appear in Codex Desktop's slash command list; `$agent-bridge 4040` also invokes the skill. Use another number, such as `4041`, for another simultaneous conversation. These are logical channels through the same Railway HTTPS origin.
+The first participant proposes a random readable word. Once both sessions have acknowledged it, the chat that sees the connection sends `agent-bridge setup: WORD`, the other answers `agent-bridge setup ack: WORD`, and each prints only `Secret word: WORD`, proving messages flow both ways. Setup is otherwise silent; a lone participant just keeps listening. Enabled skills appear in Codex Desktop's slash command list; `$agent-bridge 4040` also invokes the skill. Use another number, such as `4041`, for another simultaneous conversation. These are logical channels through the same Railway HTTPS origin.
 
 The underlying CLI is:
 
