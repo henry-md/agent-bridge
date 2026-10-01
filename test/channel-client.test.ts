@@ -174,6 +174,43 @@ test('watch falls back to status plus inbox on older relays without losing queue
   }
 });
 
+test('watch retries untyped deployment proxy errors but stops on authentication and typed missing-channel errors', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-watch-restart-')); t.after(() => rm(directory, { recursive: true, force: true }));
+  const session = randomUUID(); const generation = randomUUID(); let requests = 0; let failure = 'proxy';
+  const connection = { channel: '4040', generation, pairing_id: randomUUID(), session_id: session, secret_word: 'amber-river', status: 'connected', peer: { device: 'vm', session_id: randomUUID() }, lease_expires_at: new Date(Date.now() + 90_000).toISOString() };
+  const url = await httpFixture(t, (_req, res) => {
+    requests++;
+    if (failure === 'proxy' && requests === 1) { res.writeHead(404).end('Deployment starting'); return; }
+    if (failure !== 'proxy') { res.writeHead(failure === 'unauthorized' ? 401 : 404, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: { code: failure, message: failure } })); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ messages: [{ text: 'survived redeploy' }], cursor: 7, acknowledged_cursor: 0, connection }));
+  });
+  const path = join(directory, 'config.json');
+  await writeFile(path, JSON.stringify({ url, token: 'token', device: 'laptop', roots: {}, channel_sessions: { '4040': { sessions: { [session]: { generation, secret_word: connection.secret_word } } } } }));
+  const result = await cli(path, ['watch', '--channel', '4040', '--timeout', '5'], session);
+  assert.equal(result.messages[0].text, 'survived redeploy'); assert.equal(requests, 2);
+  for (const code of ['unauthorized', 'channel_not_found']) {
+    failure = code; requests = 0;
+    await assert.rejects(cli(path, ['watch', '--channel', '4040', '--timeout', '5'], session), (error: unknown) => (error as { stderr: string }).stderr.includes(code));
+    assert.equal(requests, 1, 'Authorization and typed application errors must not be retried');
+  }
+});
+
+test('watch deadline cancels stalled HTTP requests and recovery backoff', { timeout: 10_000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-watch-deadline-')); t.after(() => rm(directory, { recursive: true, force: true }));
+  const session = randomUUID(); const generation = randomUUID(); let mode = 'stall'; let requests = 0;
+  const url = await httpFixture(t, (_req, res) => {
+    requests++; if (mode === 'stall') return;
+    res.writeHead(404).end('Deployment starting');
+  });
+  const path = join(directory, 'config.json');
+  await writeFile(path, JSON.stringify({ url, token: 'token', device: 'laptop', roots: {}, channel_sessions: { '4040': { sessions: { [session]: { generation, secret_word: 'amber-river' } } } } }));
+  for (const next of ['stall', 'proxy']) {
+    mode = next; requests = 0;
+    const result = await cli(path, ['watch', '--channel', '4040', '--timeout', '1'], session);
+    assert.equal(result.timed_out, true); assert.deepEqual(result.messages, []); assert.ok(requests > 0);
+  }
+});
+
 test('CLI join retries preserve the exact secret candidate and idempotency key', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-channel-retry-')); t.after(() => rm(directory, { recursive: true, force: true }));
   const bodies: string[] = []; const keys: string[] = []; const generation = randomUUID();

@@ -74,32 +74,32 @@ export class RelayClient {
   async heartbeat(roots: string[], signal?: AbortSignal) { return this.json('/v1/heartbeat', 'POST', { roots }, undefined, signal); }
   async send(input: MessageInput, idempotencyKey = randomUUID()) { return (await this.json<{ message: Message }>('/v1/messages', 'POST', input, idempotencyKey)).message; }
   async inbox(after = 0, wait = 25) { return this.json<{ messages: Message[]; cursor: number }>(`/v1/messages?after=${after}&wait=${wait}`); }
-  async joinChannel(channel: string, sessionId: string, secretWord: string, idempotencyKey = randomUUID()) {
-    return this.json<ChannelStatus>(`/v1/channels/${encodeURIComponent(channel)}/join`, 'POST', { session_id: sessionId, secret_word: secretWord }, idempotencyKey);
+  async joinChannel(channel: string, sessionId: string, secretWord: string, idempotencyKey = randomUUID(), signal?: AbortSignal) {
+    return this.json<ChannelStatus>(`/v1/channels/${encodeURIComponent(channel)}/join`, 'POST', { session_id: sessionId, secret_word: secretWord }, idempotencyKey, signal);
   }
-  async channelStatus(channel: string, sessionId: string, generation: string, wait = 0) {
+  async channelStatus(channel: string, sessionId: string, generation: string, wait = 0, signal?: AbortSignal) {
     const query = new URLSearchParams({ session_id: sessionId, generation, wait: String(wait) });
-    return this.json<ChannelStatus>(`/v1/channels/${encodeURIComponent(channel)}?${query}`);
+    return this.json<ChannelStatus>(`/v1/channels/${encodeURIComponent(channel)}?${query}`, 'GET', undefined, undefined, signal);
   }
-  async confirmChannel(channel: string, sessionId: string, generation: string, secretWord: string, pairingId: string) {
+  async confirmChannel(channel: string, sessionId: string, generation: string, secretWord: string, pairingId: string, signal?: AbortSignal) {
     // Native fetch can strand a subsequent long poll when it reuses a socket
     // after a confirmation POST. Close these small handshake responses only.
-    return this.json<ChannelStatus>(`/v1/channels/${encodeURIComponent(channel)}/confirm`, 'POST', { session_id: sessionId, generation, secret_word: secretWord, pairing_id: pairingId }, randomUUID(), undefined, { Connection: 'close' });
+    return this.json<ChannelStatus>(`/v1/channels/${encodeURIComponent(channel)}/confirm`, 'POST', { session_id: sessionId, generation, secret_word: secretWord, pairing_id: pairingId }, randomUUID(), signal, { Connection: 'close' });
   }
   async leaveChannel(channel: string, sessionId: string, generation: string, pairingId: string) {
     return this.json<Record<string, never>>(`/v1/channels/${encodeURIComponent(channel)}/sessions/${encodeURIComponent(sessionId)}?${new URLSearchParams({ generation, pairing_id: pairingId })}`, 'DELETE', undefined, randomUUID());
   }
-  async sendChannel(channel: string, input: ChannelMessageInput, idempotencyKey = randomUUID()) {
-    return (await this.json<{ message: ChannelMessage }>(`/v1/channels/${encodeURIComponent(channel)}/messages`, 'POST', input, idempotencyKey)).message;
+  async sendChannel(channel: string, input: ChannelMessageInput, idempotencyKey = randomUUID(), signal?: AbortSignal) {
+    return (await this.json<{ message: ChannelMessage }>(`/v1/channels/${encodeURIComponent(channel)}/messages`, 'POST', input, idempotencyKey, signal)).message;
   }
-  async channelInbox(channel: string, sessionId: string, generation: string, after?: number, wait = 25, connection = false) {
+  async channelInbox(channel: string, sessionId: string, generation: string, after?: number, wait = 25, connection = false, signal?: AbortSignal) {
     const query = new URLSearchParams({ session_id: sessionId, generation, wait: String(wait) });
     if (after !== undefined) query.set('after', String(after));
     if (connection) query.set('state', '1');
-    return this.json<ChannelInbox>(`/v1/channels/${encodeURIComponent(channel)}/messages?${query}`);
+    return this.json<ChannelInbox>(`/v1/channels/${encodeURIComponent(channel)}/messages?${query}`, 'GET', undefined, undefined, signal);
   }
-  async acknowledgeChannel(channel: string, sessionId: string, generation: string, cursor: number) {
-    return this.json<{ acknowledged_cursor: number }>(`/v1/channels/${encodeURIComponent(channel)}/ack`, 'POST', { session_id: sessionId, generation, cursor }, randomUUID());
+  async acknowledgeChannel(channel: string, sessionId: string, generation: string, cursor: number, signal?: AbortSignal) {
+    return this.json<{ acknowledged_cursor: number }>(`/v1/channels/${encodeURIComponent(channel)}/ack`, 'POST', { session_id: sessionId, generation, cursor }, randomUUID(), signal);
   }
   async createRequest(input: RequestInput, idempotencyKey = randomUUID()) { return (await this.json<{ request: RemoteRequest }>('/v1/requests', 'POST', input, idempotencyKey)).request; }
   async request(id: string, wait = 25) { return (await this.json<{ request: RemoteRequest }>(`/v1/requests/${encodeURIComponent(id)}?wait=${wait}`)).request; }

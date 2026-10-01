@@ -23,3 +23,5 @@ Measure AI response time separately, from initiating the send through receiving 
 Change one factor at a time and compare matched trials. Retain checksum-verified uploads, token revocation, session fencing, durable retries, and reconnect tests while improving latency.
 
 Channel polling renews its persisted activity lease at most every five seconds, or every third of a shorter configured lease. Idle reads between renewals do not write SQLite. Message and acknowledgment commits retain `synchronous=FULL`; this optimization changes only how often an otherwise unchanged lease is extended.
+
+Watchers retry untyped HTTP 404 responses from a restarting deployment proxy, with a short jittered backoff capped near two seconds. Typed application errors and revoked credentials still stop the watcher. A watch deadline cancels in-flight channel requests and retry delays, rather than waiting for each request's independent timeout.

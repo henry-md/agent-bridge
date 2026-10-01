@@ -1,4 +1,5 @@
 import { randomBytes, randomInt, randomUUID } from 'node:crypto';
+import { setTimeout as pause } from 'node:timers/promises';
 import { z } from 'zod';
 import { BridgeError, channelIdSchema, channelMessageInputSchema, type ChannelInbox, type ChannelMessage, type ChannelStatus } from '../shared/protocol.js';
 import { readConfig, updateConfig, type BridgeConfig, type ChannelSessionConfig } from './config.js';
@@ -57,27 +58,27 @@ async function saveStatus(expected: BridgeConfig, original: LocalChannelSession,
     return { ...current, channel_sessions: { ...current.channel_sessions, [original.channel]: { ...saved, sessions: { ...saved.sessions, [original.session_id]: { generation: status.generation, secret_word: status.secret_word } } } } };
   });
 }
-async function confirmStatus(client: RelayClient, initial: ChannelStatus): Promise<ChannelStatus> {
+async function confirmStatus(client: RelayClient, initial: ChannelStatus, signal?: AbortSignal): Promise<ChannelStatus> {
   let status = initial;
   for (let attempt = 0; ; attempt++) {
-    try { return await client.confirmChannel(status.channel, status.session_id, status.generation, status.secret_word, status.pairing_id); }
+    try { return await client.confirmChannel(status.channel, status.session_id, status.generation, status.secret_word, status.pairing_id, signal); }
     catch (error) {
       if (!(error instanceof BridgeError) || error.code !== 'channel_pairing_changed' || attempt >= 2) throw error;
-      status = await client.channelStatus(status.channel, status.session_id, status.generation, 0);
+      status = await client.channelStatus(status.channel, status.session_id, status.generation, 0, signal);
     }
   }
 }
-export async function joinChannel(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string, waitSeconds = 25): Promise<ChannelStatus> {
+export async function joinChannel(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string, waitSeconds = 25, signal?: AbortSignal): Promise<ChannelStatus> {
   const session = await reserveSession(config, channel, sessionId);
-  let status = await client.joinChannel(session.channel, session.session_id, session.secret_word);
+  let status = await client.joinChannel(session.channel, session.session_id, session.secret_word, undefined, signal);
   await saveStatus(config, session, status);
-  status = await confirmStatus(client, status);
+  status = await confirmStatus(client, status, signal);
   const deadline = Date.now() + waitSeconds * 1000;
   while (status.status !== 'connected' && Date.now() < deadline) {
-    status = await client.channelStatus(status.channel, status.session_id, status.generation, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
+    status = await client.channelStatus(status.channel, status.session_id, status.generation, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)), signal);
     // Joining/replacing a peer resets both confirmations. Confirm the word again
     // after a poll so the original participant can complete the mutual handshake.
-    status = await confirmStatus(client, status);
+    status = await confirmStatus(client, status, signal);
   }
   return status;
 }
@@ -106,44 +107,49 @@ export async function leaveChannel(client: RelayClient, config: BridgeConfig, ch
 const rejoinCodes = new Set(['channel_session_expired', 'stale_generation']);
 // Network failures, relay restarts and pairing churn pass; authentication and identity errors do not.
 function transientFailure(error: unknown): boolean {
-  if (error instanceof BridgeError) return error.status >= 500 || error.status === 429 || error.code === 'channel_pairing_changed';
+  if (error instanceof BridgeError) return error.status >= 500 || error.status === 429 || error.code === 'channel_pairing_changed' || (error.status === 404 && error.code === 'HTTP_ERROR');
   return error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError' || (error instanceof TypeError && error.message === 'fetch failed'));
 }
-const pause = (ms: number) => new Promise(resolvePromise => setTimeout(resolvePromise, ms));
-async function rejoin(client: RelayClient, config: BridgeConfig, session: LocalChannelSession): Promise<LocalChannelSession & { generation: string }> {
-  await joinChannel(client, config, session.channel, session.session_id, 0);
+async function rejoin(client: RelayClient, config: BridgeConfig, session: LocalChannelSession, signal?: AbortSignal): Promise<LocalChannelSession & { generation: string }> {
+  await joinChannel(client, config, session.channel, session.session_id, 0, signal);
   return requireChannelSession(await readConfig(), session.channel, session.session_id);
 }
 export interface WatchResult extends ChannelInbox { channel: string; session_id: string; timed_out: boolean }
 export async function watchChannel(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string, timeoutSeconds = 0): Promise<WatchResult> {
   const deadline = timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : Infinity;
+  const controller = new AbortController();
+  const timer = timeoutSeconds > 0 ? setTimeout(() => controller.abort(), timeoutSeconds * 1000) : undefined;
+  timer?.unref(); const signal = controller.signal;
   let session = requireChannelSession(config, channel, sessionId);
   let page: ChannelInbox | undefined; let needsRejoin = false; let failures = 0;
   let legacyInbox = false;
-  while (Date.now() < deadline) {
+  try { while (Date.now() < deadline && !signal.aborted) {
     try {
-      if (needsRejoin) { session = await rejoin(client, config, session); needsRejoin = false; }
+      if (needsRejoin) { session = await rejoin(client, config, session, signal); needsRejoin = false; }
       // Current relays include the connection snapshot in the inbox poll, avoiding
       // a separate status request before every receive. Older relays keep working.
       if (legacyInbox) {
-        const status = await client.channelStatus(session.channel, session.session_id, session.generation, 0);
-        if (status.peer && status.status !== 'connected') await confirmStatus(client, status);
+        const status = await client.channelStatus(session.channel, session.session_id, session.generation, 0, signal);
+        if (status.peer && status.status !== 'connected') await confirmStatus(client, status, signal);
       }
-      page = await client.channelInbox(session.channel, session.session_id, session.generation, undefined, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)), !legacyInbox);
+      page = await client.channelInbox(session.channel, session.session_id, session.generation, undefined, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)), !legacyInbox, signal);
       if (!legacyInbox && !page.connection) {
         legacyInbox = true;
         if (!page.messages.length) continue;
       }
-      if (page.connection?.peer && page.connection.status !== 'connected') await confirmStatus(client, page.connection);
+      if (page.connection?.peer && page.connection.status !== 'connected') await confirmStatus(client, page.connection, signal);
       failures = 0;
       if (page.messages.length) return { ...page, channel: session.channel, session_id: session.session_id, timed_out: false };
     } catch (error) {
+      if (signal.aborted) break;
       if (!legacyInbox && error instanceof BridgeError && error.status === 400 && error.code === 'invalid_input') { legacyInbox = true; continue; }
       if (error instanceof BridgeError && rejoinCodes.has(error.code)) { needsRejoin = true; continue; }
       if (!transientFailure(error)) throw error;
-      failures++; await pause(Math.min(30_000, 1000 * 2 ** Math.min(failures, 5)));
+      failures++;
+      try { await pause(Math.min(2000, 100 * 2 ** Math.min(failures - 1, 5)) + Math.random() * 100, undefined, { signal }); }
+      catch (error) { if (!signal.aborted) throw error; }
     }
-  }
+  } } finally { clearTimeout(timer); }
   return { messages: [], cursor: page?.cursor ?? 0, acknowledged_cursor: page?.acknowledged_cursor ?? 0, channel: session.channel, session_id: session.session_id, timed_out: true };
 }
 export async function sendChannelMessage(client: RelayClient, config: BridgeConfig, channel: string, sessionId: string | undefined, text: string, fileIds: string[], idempotencyKey = randomUUID()): Promise<ChannelMessage> {
