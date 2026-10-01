@@ -29,12 +29,12 @@ After one-time device registration, install the skill on both computers: `bridge
 /agent-bridge 4040
 ```
 
-The first participant proposes a random readable word. Once both sessions have acknowledged it, the chat that sees the connection sends `agent-bridge setup: WORD`, the other answers `agent-bridge setup ack: WORD`, and each prints only `Secret word: WORD`, proving messages flow both ways. Setup is otherwise silent; a lone participant just keeps listening. Enabled skills appear in Codex Desktop's slash command list; `$agent-bridge 4040` also invokes the skill. Use another number, such as `4041`, for another simultaneous conversation. These are logical channels through the same Railway HTTPS origin.
+The first participant proposes a random readable word. The CLI joins and exchanges setup messages in one process; each chat prints only `Secret word: WORD` after a fresh peer message confirms delivery. Setup is otherwise silent; a lone participant keeps waiting. Enabled skills appear in Codex Desktop's slash command list; `$agent-bridge 4040` also invokes the skill. Use another number, such as `4041`, for another simultaneous conversation. These are logical channels through the same Railway HTTPS origin.
 
 The underlying CLI is:
 
 ```sh
-bridge channel join 4040 --wait 25
+bridge channel pair 4040 --timeout 600
 bridge send --channel 4040 --text 'Please inspect the VM export.'
 bridge inbox --channel 4040 --wait 25
 # Block until the next messages arrive, recovering the session as needed.
@@ -52,6 +52,8 @@ Inbox reads leave channel messages unacknowledged until `channel ack`; explicit 
 `bridge watch --channel N` exits as soon as unacknowledged messages arrive, or with `"timed_out": true` after `--timeout SECONDS`. It rejoins an expired session with the same identity and retries through network failures and relay restarts. Claude Code wakes an idle chat when a background command finishes, so the skill runs the watcher in the background. Codex does not, so the skill keeps a foreground watch loop running inside the turn.
 
 A file connector is needed for remote folder reads, but channel pairing and messages work without it. The skill never launches agents automatically.
+
+`channel pair` returns `verified`, `connection`, setup timings, and any ordinary `messages` encountered while exchanging the word. Print the word only when `verified` is true. Process ordinary mail before acknowledging the returned cursor; the command never acknowledges past it. Timeout or cancellation keeps the session joined. Use one reader per channel, and replace it with the same session ID after rebuilding. The lower-level `channel join --wait 25` command remains available for clients that manage their own handshake. See [latency measurements](docs/latency.md) for separate transport and agent response metrics.
 
 ## Build and run locally
 

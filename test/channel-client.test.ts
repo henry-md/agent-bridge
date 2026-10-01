@@ -57,6 +57,56 @@ test('actual CLI joins use Codex chat identities and produce the same word only 
   const afterLeave = await cli(a, ['channel', 'status', '4040'], aSession); assert.equal(afterLeave.status, 'waiting'); assert.ok(!afterLeave.confirmation.includes('Connected'));
 });
 
+test('single-command pairing exchanges the word for simultaneous and staggered CLI participants', { timeout: 30_000 }, async t => {
+  const h = await harness(t); const a = await h.device('laptop'); const b = await h.device('vm');
+  for (const channel of ['4040', '5050']) {
+    const aSession = randomUUID(); const bSession = randomUUID();
+    const first = cli(a, ['channel', 'pair', channel, '--timeout', '8'], aSession);
+    if (channel === '5050') await delay(150);
+    const second = cli(b, ['channel', 'pair', channel, '--timeout', '8'], bSession);
+    const results = await Promise.all([first, second]);
+    for (const result of results) {
+      assert.equal(result.verified, true); assert.equal(result.timed_out, false); assert.equal(result.connection.status, 'connected');
+      assert.ok(result.setup_ms >= result.relay_connected_ms); assert.ok(result.confirmation_ms >= 0); assert.deepEqual(result.messages, []);
+    }
+    assert.equal(results[0].connection.secret_word, results[1].connection.secret_word);
+    assert.equal(results[0].connection.peer.session_id, bSession); assert.equal(results[1].connection.peer.session_id, aSession);
+  }
+});
+
+test('pairing accepts a legacy setup acknowledgment and preserves queued ordinary mail across timeout', { timeout: 30_000 }, async t => {
+  const h = await harness(t); const a = await h.device('laptop'); const b = await h.device('vm');
+  const aSession = randomUUID(); const bSession = randomUUID();
+  const [joined] = await pair(a, b, '4040', aSession, bSession);
+  const word = joined.secret_word;
+  const stale = await cli(b, ['send', '--channel', '4040', '--text', `agent-bridge setup ack: ${word}`], bSession);
+  const ordinary = await cli(b, ['send', '--channel', '4040', '--text', 'preserve this ordinary context'], bSession);
+  await cli(b, ['send', '--channel', '4040', '--text', `agent-bridge setup ack: ${word}`], bSession);
+  const config = JSON.parse(await readFile(b, 'utf8')); const client = new RelayClient(config.url, config.token);
+  const attachmentPath = join(h.directory, 'context.bin'); await writeFile(attachmentPath, 'attached context');
+  const attachment = await client.upload(attachmentPath);
+  const attached = await client.sendChannel('4040', { session_id: bSession, generation: joined.generation, text: `agent-bridge setup: ${word}`, file_ids: [attachment.id] });
+  const timeout = await cli(a, ['channel', 'pair', '4040', '--timeout', '1'], aSession);
+  assert.equal(timeout.verified, false, 'An old queued acknowledgment must not prove this invocation');
+  assert.deepEqual(timeout.messages.map((message: { text: string }) => message.text), ['preserve this ordinary context', `agent-bridge setup: ${word}`]);
+  assert.equal(timeout.acknowledged_cursor, stale.message.seq, 'Controls after ordinary mail must not advance its acknowledgment');
+  assert.equal(timeout.cursor, attached.seq);
+  const pending = await cli(a, ['inbox', '--channel', '4040', '--wait', '0'], aSession);
+  assert.equal(pending.messages[0].id, ordinary.message.id); assert.equal(pending.messages.at(-1).id, attached.id);
+  // Drain the timed-out invocation's probe before starting the next one.
+  let probes = await cli(b, ['watch', '--channel', '4040', '--timeout', '5'], bSession);
+  await cli(b, ['channel', 'ack', '4040', String(probes.cursor)], bSession);
+  const next = cli(a, ['channel', 'pair', '4040', '--timeout', '8'], aSession);
+  // Receive the new probe using the original skill's watch/send/ack workflow.
+  probes = await cli(b, ['watch', '--channel', '4040', '--timeout', '5'], bSession);
+  assert.ok(probes.messages.some((message: { text: string }) => message.text === `agent-bridge setup: ${word}`));
+  await cli(b, ['send', '--channel', '4040', '--text', `agent-bridge setup ack: ${word}`], bSession);
+  await cli(b, ['channel', 'ack', '4040', String(probes.cursor)], bSession);
+  const confirmed = await next;
+  assert.equal(confirmed.verified, true); assert.equal(confirmed.messages[0].id, ordinary.message.id);
+  assert.equal((await cli(a, ['inbox', '--channel', '4040', '--wait', '0'], aSession)).messages[0].id, ordinary.message.id);
+});
+
 test('parallel chat channels merge configuration and keep messages and acknowledgments independent', { timeout: 30_000 }, async t => {
   const h = await harness(t); const a = await h.device('laptop'); const b = await h.device('vm');
   const a1 = randomUUID(); const b1 = randomUUID(); const a2 = randomUUID(); const b2 = randomUUID();

@@ -1,5 +1,6 @@
 import { randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { setTimeout as pause } from 'node:timers/promises';
+import { performance } from 'node:perf_hooks';
 import { z } from 'zod';
 import { BridgeError, channelIdSchema, channelMessageInputSchema, type ChannelInbox, type ChannelMessage, type ChannelStatus } from '../shared/protocol.js';
 import { readConfig, updateConfig, type BridgeConfig, type ChannelSessionConfig } from './config.js';
@@ -72,7 +73,7 @@ export async function joinChannel(client: RelayClient, config: BridgeConfig, cha
   const session = await reserveSession(config, channel, sessionId);
   let status = await client.joinChannel(session.channel, session.session_id, session.secret_word, undefined, signal);
   await saveStatus(config, session, status);
-  status = await confirmStatus(client, status, signal);
+  if (status.status !== 'connected') status = await confirmStatus(client, status, signal);
   const deadline = Date.now() + waitSeconds * 1000;
   while (status.status !== 'connected' && Date.now() < deadline) {
     status = await client.channelStatus(status.channel, status.session_id, status.generation, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)), signal);
@@ -82,10 +83,10 @@ export async function joinChannel(client: RelayClient, config: BridgeConfig, cha
   }
   return status;
 }
-export async function channelStatus(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string, waitSeconds = 0): Promise<ChannelStatus> {
+export async function channelStatus(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string, waitSeconds = 0, signal?: AbortSignal): Promise<ChannelStatus> {
   const session = requireChannelSession(config, channel, sessionId);
-  let status = await client.channelStatus(session.channel, session.session_id, session.generation, waitSeconds);
-  if (status.status !== 'connected') status = await confirmStatus(client, status);
+  let status = await client.channelStatus(session.channel, session.session_id, session.generation, waitSeconds, signal);
+  if (status.status !== 'connected') status = await confirmStatus(client, status, signal);
   return status;
 }
 export async function leaveChannel(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string): Promise<LocalChannelSession> {
@@ -160,6 +161,109 @@ export async function watchChannel(client: RelayClient, config: BridgeConfig, ch
   } } finally { clearTimeout(timer); }
   return { messages: [], cursor: page?.cursor ?? 0, acknowledged_cursor: page?.acknowledged_cursor ?? 0, channel: session.channel, session_id: session.session_id, timed_out: true };
 }
+export interface PairResult extends WatchResult {
+  verified: boolean; cancelled: boolean; setup_ms: number; relay_connected_ms?: number; confirmation_ms?: number;
+}
+const setupControl = (message: ChannelMessage) => message.file_ids.length === 0 ? /^agent-bridge setup( ack)?: ([a-z0-9-]{3,80})$/.exec(message.text) : null;
+const connectionIdentity = (status: ChannelStatus) => `${status.generation}/${status.pairing_id}/${status.peer?.session_id ?? ''}`;
+
+// Pairing is one process, so the word exchange does not need intermediate model
+// turns. Ordinary mail stays unacknowledged even if controls follow it in a page.
+export async function pairChannel(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string, timeoutSeconds = 600, cancellation?: AbortSignal): Promise<PairResult> {
+  validateChannelTimeout(timeoutSeconds); channelId(channel);
+  const requestedSession = explicitSession(sessionId);
+  const started = performance.now(); const controller = new AbortController();
+  const timer = timeoutSeconds > 0 ? setTimeout(() => controller.abort(), timeoutSeconds * 1000) : undefined;
+  timer?.unref(); const signal = cancellation ? AbortSignal.any([controller.signal, cancellation]) : controller.signal;
+  let status: ChannelStatus | undefined; let session: LocalChannelSession & { generation: string } | undefined;
+  let probe: { identity: string; key: string; seq?: number } | undefined;
+  let proofIdentity: string | undefined;
+  let scanCursor: number | undefined; let acknowledged = 0; let prefixCursor = 0; let blockedAck = false;
+  let relayConnectedMs: number | undefined; let legacyInbox = false; let failures = 0;
+  const messages = new Map<string, ChannelMessage>(); const replies = new Map<string, string>();
+  const result = (verified: boolean): PairResult => ({
+    messages: [...messages.values()], cursor: Math.max(scanCursor ?? acknowledged, ...[...messages.values()].filter(message => message.generation === session?.generation).map(message => message.seq)), acknowledged_cursor: acknowledged,
+    channel, session_id: session?.session_id ?? status?.session_id ?? requestedSession ?? '', timed_out: !verified && !cancellation?.aborted, verified, cancelled: !!cancellation?.aborted,
+    ...(status ? { connection: status } : {}), setup_ms: performance.now() - started,
+    ...(relayConnectedMs === undefined ? {} : { relay_connected_ms: relayConnectedMs, confirmation_ms: performance.now() - started - relayConnectedMs }),
+  });
+  async function ensureProbe() {
+    if (status!.status !== 'connected' || !status!.peer) { probe = undefined; proofIdentity = undefined; return; }
+    relayConnectedMs ??= performance.now() - started;
+    const identity = connectionIdentity(status!);
+    if (probe?.identity !== identity) { probe = { identity, key: randomUUID() }; proofIdentity = undefined; }
+    if (probe.seq !== undefined) return;
+    const sent = await client.sendChannel(channel, { session_id: session!.session_id, generation: session!.generation, text: `agent-bridge setup: ${status!.secret_word}`, file_ids: [] }, probe.key, signal);
+    if (sent.to_session !== status!.peer.session_id) throw new BridgeError(409, 'channel_pairing_changed', 'Peer changed while sending the setup probe');
+    probe.seq = sent.seq;
+  }
+  try {
+    while (!signal.aborted) {
+      try {
+        if (!session) {
+          status = await joinChannel(client, config, channel, requestedSession, 0, signal);
+          session = requireChannelSession(await readConfig(), channel, status.session_id);
+        }
+        if (!status) status = await client.channelStatus(channel, session.session_id, session.generation, 0, signal);
+        if (proofIdentity) {
+          status = await client.channelStatus(channel, session.session_id, session.generation, 0, signal);
+          if (status.status === 'connected' && connectionIdentity(status) === proofIdentity) return result(true);
+          proofIdentity = undefined;
+        }
+        if (status!.status !== 'connected') {
+          status = await client.channelStatus(channel, session.session_id, session.generation, 25, signal);
+          if (status.peer && status.status !== 'connected') status = await confirmStatus(client, status, signal);
+          if (status.status !== 'connected') continue;
+        }
+        await ensureProbe();
+        const page = await client.channelInbox(channel, session.session_id, session.generation, scanCursor, 25, !legacyInbox, signal);
+        status = page.connection ?? await client.channelStatus(channel, session.session_id, session.generation, 0, signal);
+        if (!page.connection) legacyInbox = true;
+        if (status.peer && status.status !== 'connected') status = await confirmStatus(client, status, signal);
+        await ensureProbe();
+        acknowledged = page.acknowledged_cursor; prefixCursor = Math.max(prefixCursor, acknowledged);
+        let proof = false;
+        for (const message of page.messages) if (!setupControl(message)) messages.set(message.id, message);
+        for (const message of page.messages) {
+          const control = setupControl(message);
+          if (!control) { blockedAck = true; messages.set(message.id, message); continue; }
+          if (!blockedAck) prefixCursor = message.seq;
+          const currentPeer = message.generation === status.generation && message.from_session === status.peer?.session_id;
+          if (!currentPeer) continue;
+          if (control[2] !== status.secret_word) throw new BridgeError(409, 'CHANNEL_WORD_MISMATCH', 'Peer setup word differs from this channel');
+          if (!control[1]) {
+            let key = replies.get(message.id); if (!key) { key = randomUUID(); replies.set(message.id, key); }
+            const reply = await client.sendChannel(channel, { session_id: session.session_id, generation: session.generation, text: `agent-bridge setup ack: ${status.secret_word}`, file_ids: [] }, key, signal);
+            if (reply.to_session !== status.peer?.session_id) throw new BridgeError(409, 'channel_pairing_changed', 'Peer changed while replying to setup');
+          }
+          if (probe?.seq !== undefined && message.seq > probe.seq) proof = true;
+        }
+        if (prefixCursor > acknowledged) acknowledged = (await client.acknowledgeChannel(channel, session.session_id, session.generation, prefixCursor, signal)).acknowledged_cursor;
+        scanCursor = page.cursor; failures = 0;
+        if (proof) {
+          proofIdentity = probe!.identity;
+          const verifiedStatus = await client.channelStatus(channel, session.session_id, session.generation, 0, signal);
+          if (verifiedStatus.status === 'connected' && connectionIdentity(verifiedStatus) === probe?.identity) { status = verifiedStatus; return result(true); }
+          status = verifiedStatus; probe = undefined; proofIdentity = undefined;
+        }
+      } catch (error) {
+        if (signal.aborted) break;
+        if (!legacyInbox && error instanceof BridgeError && error.status === 400 && error.code === 'invalid_input') { legacyInbox = true; continue; }
+        if (error instanceof BridgeError && rejoinCodes.has(error.code)) {
+          session = undefined; status = undefined; probe = undefined; proofIdentity = undefined; scanCursor = undefined; acknowledged = 0; prefixCursor = 0; blockedAck = messages.size > 0; continue;
+        }
+        const reconnectPairing = error instanceof BridgeError && ['channel_pairing_changed', 'channel_not_connected'].includes(error.code);
+        if (!transientFailure(error) && !reconnectPairing) throw error;
+        if (reconnectPairing) status = undefined;
+        failures++;
+        try { await pause(Math.min(2000, 100 * 2 ** Math.min(failures - 1, 5)) + Math.random() * 100, undefined, { signal }); }
+        catch (error) { if (!signal.aborted) throw error; }
+      }
+    }
+    return result(false);
+  } finally { clearTimeout(timer); }
+}
+
 export async function sendChannelMessage(client: RelayClient, config: BridgeConfig, channel: string, sessionId: string | undefined, text: string, fileIds: string[], idempotencyKey = randomUUID()): Promise<ChannelMessage> {
   let session = requireChannelSession(config, channel, sessionId);
   const deadline = Date.now() + 60_000;

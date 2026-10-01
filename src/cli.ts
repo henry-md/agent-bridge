@@ -9,7 +9,7 @@ import { BridgeError, messageInputSchema, nameSchema, requestInputSchema } from 
 import { configPath, readConfig, tokenFromEnv, updateConfig, type BridgeConfig } from './client/config.js';
 import { RelayClient, validateRelayUrl } from './client/relay.js';
 import { runConnector } from './client/connector.js';
-import { channelId, channelResult, channelStatus, joinChannel, leaveChannel, requireChannelSession, sendChannelMessage, validateChannelTimeout, watchChannel } from './client/channel.js';
+import { channelId, channelResult, channelStatus, joinChannel, leaveChannel, pairChannel, requireChannelSession, sendChannelMessage, validateChannelTimeout, watchChannel } from './client/channel.js';
 
 const program = new Command().name('bridge').description('Exchange messages and file context through your private Railway relay').version('0.1.0');
 program.configureOutput({ outputError: () => {} });
@@ -65,6 +65,12 @@ for (const operation of ['read', 'list', 'search'] as const) {
   });
 }
 const channels = program.command('channel').description('Pair two chat sessions on a numeric channel');
+channels.command('pair').description('Join and exchange the setup word in one process; ordinary mail remains unacknowledged').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').option('--timeout <seconds>', 'Total setup deadline; 0 waits indefinitely', channelTimeout, 600).action(async (channel, options) => {
+  const { config, client } = await localClient(); const controller = new AbortController(); const stop = () => controller.abort();
+  process.once('SIGINT', stop); process.once('SIGTERM', stop);
+  try { output(await pairChannel(client, config, channel, options.session, options.timeout, controller.signal)); }
+  finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
+});
 channels.command('join').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID; defaults to CODEX_THREAD_ID or a saved per-channel UUID').option('--wait <seconds>', 'Wait for the mutual handshake, 0–25 seconds', wait, 25).action(async (channel, options) => {
   const { config, client } = await localClient(); output(channelResult(await joinChannel(client, config, channel, options.session, options.wait)));
 });
