@@ -4,7 +4,7 @@ export default defineRailway(() => {
   const agentBridgeVolume = volume("agent-bridge-volume", { alerts: { usage: { "100": {}, "80": {}, "95": {} } }, allowOnlineResize: true, region: "us-east4-eqdc4a", sizeMB: 5000 });
   const agentBridge = service("agent-bridge", {
     source: github("henry-md/agent-bridge", { branch: "main", checkSuites: true }),
-    build: { buildEnvironment: "V3", builder: "DOCKERFILE", dockerfilePath: "Dockerfile" },
+    build: { buildEnvironment: "V3", builder: "DOCKERFILE", dockerfilePath: "Dockerfile", watchPatterns: ["/src/server/**", "/src/shared/**", "/Dockerfile", "/.dockerignore", "/package.json", "/package-lock.json", "/tsconfig.json", "/railway.json", "/railway.toml"] },
     healthcheck: "/healthz",
     healthcheckTimeout: 60,
     deploy: { sleepApplication: false, restartPolicyType: "ON_FAILURE", restartPolicyMaxRetries: 10 },
