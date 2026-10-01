@@ -108,21 +108,27 @@ program.command('skill').command('install').option('--project <path>', 'Install 
   else destination = resolve(homedir(), '.codex/skills/agent-bridge');
   const source = resolve(dirname(fileURLToPath(import.meta.url)), '../.agents/skills/agent-bridge');
   await mkdir(dirname(destination), { recursive: true });
-  const staging = `${destination}.${randomUUID()}.tmp`; const backup = `${destination}.${randomUUID()}.backup`;
-  let reserved = false; let backedUp = false;
+  const staging = `${destination}.${randomUUID()}.tmp`; const backup = `${destination}.${randomUUID()}.backup`; const lock = `${destination}.install-lock`;
+  try { await mkdir(lock, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new BridgeError(0, 'SKILL_INSTALL_BUSY', 'Another command is installing this skill; retry after it finishes'); throw error; }
+  let installed = false; let backedUp = false;
   try {
     await cp(source, staging, { recursive: true, force: false, errorOnExist: true });
-    if (options.force) {
-      try { await lstat(destination); await rename(destination, backup); backedUp = true; } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    let exists = false;
+    try { await lstat(destination); exists = true; } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (exists) {
+      if (!options.force) throw new BridgeError(0, 'SKILL_EXISTS', 'Skill already exists; use --force to replace it');
+      await rename(destination, backup); backedUp = true;
     }
-    try { await mkdir(destination); reserved = true; } catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new BridgeError(0, 'SKILL_EXISTS', 'Skill already exists; use --force to replace it'); throw error; }
-    await rename(staging, destination); reserved = false;
-    if (backedUp) { await rm(backup, { recursive: true, force: true }); backedUp = false; }
+    // Windows cannot rename over even an empty directory. The sibling lock
+    // reserves this installation while publication targets an absent path.
+    await rename(staging, destination); installed = true;
   } catch (error) {
-    if (reserved) await rm(destination, { recursive: true, force: true });
-    if (backedUp) await rename(backup, destination);
+    if (backedUp) { await rename(backup, destination); backedUp = false; }
     throw error;
-  } finally { await rm(staging, { recursive: true, force: true }); }
+  } finally {
+    try { await rm(staging, { recursive: true, force: true }); if (installed && backedUp) await rm(backup, { recursive: true, force: true }); }
+    finally { await rm(lock, { recursive: true, force: true }); }
+  }
   output({ installed: resolve(destination, 'SKILL.md'), scope: options.project ? 'project' : 'user' });
 });
 try { await program.parseAsync(); } catch (error) {
