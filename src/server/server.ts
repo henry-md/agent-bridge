@@ -184,7 +184,10 @@ export async function createServer(options: ServerOptions) {
     if (!row || row.device_name !== who.name) throw new BridgeError(403, 'channel_session_mismatch', 'This session does not belong to the authenticated device');
     if (row.lease_until === REPLACED_LEASE) throw new BridgeError(409, 'channel_session_replaced', 'Another chat on this device took over this channel');
     if (row.lease_until <= now) throw new BridgeError(409, 'channel_session_expired', 'This channel session has expired; join again');
-    if (renew) {
+    // Reads and idle poll checks need not fsync the same ten-year lease on every
+    // request. Renew at most every five seconds, or a third of a short lease.
+    const renewalIntervalMs = Math.min(5000, Math.max(1, Math.floor(channelLeaseMs / 3)));
+    if (renew && row.lease_until <= now + channelLeaseMs - renewalIntervalMs) {
       row.lease_until = now + channelLeaseMs;
       db.prepare('UPDATE channel_members SET lease_until = ? WHERE generation = ? AND session_id = ?').run(row.lease_until, round.generation, session);
     }

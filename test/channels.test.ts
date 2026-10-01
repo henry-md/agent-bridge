@@ -198,6 +198,25 @@ test('state inbox wakes for an unconfirmed peer and mutual confirmation, but kee
   assert.equal(received.acknowledged_cursor, 0, 'Connection metadata must not acknowledge messages');
 });
 
+test('idle channel reads avoid SQLite writes and renew durably at the lease cadence', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const f = await fixture(t); const token = await f.register('first'); const member = await f.joinChannel(token);
+  const inspect = new DatabaseSync(join(f.dataDir, 'bridge.sqlite'), { readOnly: true });
+  t.after(() => inspect.close());
+  const version = () => inspect.prepare('PRAGMA data_version').get()!.data_version;
+  const lease = () => (inspect.prepare('SELECT lease_until FROM channel_members WHERE generation = ? AND session_id = ?').get(member.generation, member.session_id) as { lease_until: number }).lease_until;
+  const initialVersion = version(); const initialLease = lease();
+  for (let index = 0; index < 5; index++) { t.mock.timers.tick(500); await f.status(token, member); await f.inbox(token, member); }
+  assert.equal(version(), initialVersion, 'Status and inbox reads must not commit unchanged lease updates');
+  assert.equal(lease(), initialLease);
+  t.mock.timers.tick(2500);
+  const renewed = await f.status(token, member);
+  assert.notEqual(version(), initialVersion); assert.equal(lease(), initialLease + 5000);
+  assert.equal(Date.parse(renewed.lease_expires_at), lease(), 'Status reports the lease actually committed to SQLite');
+  const afterRenewal = version(); await f.inbox(token, member);
+  assert.equal(version(), afterRenewal, 'An immediate repeat read must not commit again');
+});
+
 test('lease expiry and leave remove connected state, require new acknowledgment and reset dead round words', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const f = await fixture(t, { channelLeaseMs: 1000 });

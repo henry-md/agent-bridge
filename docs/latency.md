@@ -21,3 +21,5 @@ The primary metric is a nonce-matched round trip on the controller's monotonic c
 Measure AI response time separately, from initiating the send through receiving the corresponding actual agent reply. This includes model scheduling, reasoning, and tool calls. For startup, separate waiting for the other participant from mutual relay confirmation and from the final setup acknowledgment. A first participant's deliberate wait is not a network latency measurement.
 
 Change one factor at a time and compare matched trials. Retain checksum-verified uploads, token revocation, session fencing, durable retries, and reconnect tests while improving latency.
+
+Channel polling renews its persisted activity lease at most every five seconds, or every third of a shorter configured lease. Idle reads between renewals do not write SQLite. Message and acknowledgment commits retain `synchronous=FULL`; this optimization changes only how often an otherwise unchanged lease is extended.
