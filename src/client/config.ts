@@ -2,6 +2,7 @@ import { chmod, mkdir, readFile, rename, writeFile, realpath, rm } from 'node:fs
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { BridgeError, channelIdSchema, nameSchema } from '../shared/protocol.js';
 import { validateRelayUrl } from './relay.js';
@@ -10,6 +11,16 @@ export interface ChannelSessionConfig { generation?: string; secret_word: string
 export interface ChannelConfig { fallback_session_id?: string; sessions: Record<string, ChannelSessionConfig> }
 export interface BridgeConfig { url: string; token?: string; device?: string; roots: Record<string, string>; inbox_cursor?: number; channel_sessions?: Record<string, ChannelConfig> }
 const channelSessionsSchema = z.record(channelIdSchema, z.object({ fallback_session_id: z.string().uuid().optional(), sessions: z.record(z.string().uuid(), z.object({ generation: z.string().uuid().optional(), secret_word: z.string().regex(/^[a-z0-9-]{3,80}$/) }).strict()) }).strict());
+const windowsFileLock = (error: unknown) => process.platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '');
+async function retryFileLock<T>(operation: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await operation(); }
+    catch (error) {
+      if (!windowsFileLock(error) || attempt >= 8) throw error;
+      await delay(Math.min(100, 25 * (attempt + 1)));
+    }
+  }
+}
 export function configPath(): string { return resolve(process.env.BRIDGE_CONFIG ?? `${homedir()}/.agent-bridge/config.json`); }
 export async function readConfig(requireToken = true): Promise<BridgeConfig> {
   let config: BridgeConfig;
@@ -36,9 +47,11 @@ async function saveConfig(config: BridgeConfig): Promise<void> {
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-    await rename(temporary, path);
+    // Windows readers and antivirus handles can briefly forbid replacement.
+    // Keep the writer lock and retry the atomic rename; never unlink credentials.
+    await retryFileLock(() => rename(temporary, path));
     if (process.platform !== 'win32') await chmod(path, 0o600);
-  } finally { await rm(temporary, { force: true }); }
+  } finally { await retryFileLock(() => rm(temporary, { force: true })); }
 }
 export function tokenFromEnv(name: string): string { const value = process.env[name]; if (!value) throw new BridgeError(0, 'TOKEN_REQUIRED', `Environment variable ${name} is required`); return value; }
 
@@ -48,12 +61,16 @@ async function withConfigLock<T>(operation: () => Promise<T>): Promise<T> {
   const deadline = Date.now() + 2000;
   while (true) {
     try { await mkdir(lock, { mode: 0o700 }); break; } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (Date.now() > deadline) throw new BridgeError(0, 'CONFIG_BUSY', 'Another bridge command is updating configuration; retry after it finishes');
-      await new Promise(resolvePromise => setTimeout(resolvePromise, 50));
+      const occupied = (error as NodeJS.ErrnoException).code === 'EEXIST';
+      if (!occupied && !windowsFileLock(error)) throw error;
+      if (Date.now() > deadline) {
+        if (!occupied) throw error;
+        throw new BridgeError(0, 'CONFIG_BUSY', 'Another bridge command is updating configuration; retry after it finishes');
+      }
+      await delay(50);
     }
   }
-  try { return await operation(); } finally { await rm(lock, { recursive: true, force: true }); }
+  try { return await operation(); } finally { await retryFileLock(() => rm(lock, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })); }
 }
 export async function writeConfig(config: BridgeConfig): Promise<void> { await withConfigLock(() => saveConfig(config)); }
 export async function updateConfig(update: (current: BridgeConfig | undefined) => BridgeConfig): Promise<BridgeConfig> {

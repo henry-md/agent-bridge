@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { once } from 'node:events';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
 import { runConnector } from '../src/client/connector.js';
@@ -120,6 +120,32 @@ test('downloads verify checksum, publish atomically without overwrite, and clean
     await assert.rejects(client.download(info.id, target), errorCode('OUTPUT_EXISTS')); assert.deepEqual(await readFile(target), data);
     corrupt = true; await assert.rejects(client.download(info.id, join(base, 'corrupt.bin')), errorCode('CHECKSUM_MISMATCH')); assert.ok(!(await readdir(base)).some(name => name.includes('.part') || name === 'corrupt.bin'));
   } finally { await server.close(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('Windows config replacement survives a temporary file lock and preserves credentials on exhaustion', { skip: process.platform !== 'win32', timeout: 15_000 }, async () => {
+  const { base } = await fixture(); const previous = process.env.BRIDGE_CONFIG;
+  try {
+    const path = join(base, 'config.json'); process.env.BRIDGE_CONFIG = path;
+    await writeConfig({ url: 'https://bridge.example', token: 'token', roots: {} });
+    async function hold(milliseconds: number) {
+      const script = '$s = [System.IO.File]::Open($env:BRIDGE_LOCK_TEST_PATH, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite); [Console]::WriteLine("ready"); Start-Sleep -Milliseconds ' + milliseconds + '; $s.Dispose()';
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { env: { ...process.env, BRIDGE_LOCK_TEST_PATH: path } });
+      const done = once(child, 'exit'); let stderr = ''; child.stderr.on('data', chunk => { stderr += chunk; });
+      try {
+        const ready = await Promise.race([once(child.stdout, 'data'), done.then(() => { throw new Error(`Lock holder exited: ${stderr}`); })]);
+        assert.match(String(ready[0]), /ready/);
+      } catch (error) { child.kill(); await done; throw error; }
+      return done;
+    }
+    const released = await hold(300);
+    await updateConfig(current => ({ ...current!, device: 'vm' })); await released;
+    assert.equal((await readConfig()).device, 'vm'); assert.equal((await readConfig()).token, 'token');
+    const held = await hold(1500);
+    try { await assert.rejects(updateConfig(current => ({ ...current!, device: 'replacement' })), (error: unknown) => ['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '')); }
+    finally { await held; }
+    assert.equal((await readConfig()).device, 'vm'); assert.equal((await readConfig()).token, 'token');
+    assert.deepEqual((await readdir(base)).filter(name => name !== 'root'), ['config.json']);
+  } finally { if (previous === undefined) delete process.env.BRIDGE_CONFIG; else process.env.BRIDGE_CONFIG = previous; await rm(base, { recursive: true, force: true }); }
 });
 
 test('concurrent config updates merge fields under a lock', async () => {
