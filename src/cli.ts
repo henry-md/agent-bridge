@@ -90,13 +90,14 @@ program.command('send').option('--to <device>', 'Recipient for the device mailbo
   if ((options.ack !== undefined || options.watch) && !options.channel) throw new BridgeError(0, 'INVALID_ARGUMENT', '--ack and --watch require --channel');
   const { config, client } = await localClient();
   if (options.channel) {
-    const key = options.idempotencyKey ?? (options.ack === undefined ? undefined : `reply:${options.ack}`);
-    const message = await sendChannelMessage(client, config, options.channel, options.session, options.text, options.attach, key);
+    const key = options.idempotencyKey ?? (options.ack > 0 ? `reply:${options.ack}` : undefined);
+    const message = await sendChannelMessage(client, config, options.channel, options.session, options.text, options.attach, key, !(options.ack > 0));
     output({ message });
+    const current = options.ack !== undefined || options.watch ? await readConfig() : config;
+    if (current.url !== config.url || current.token !== config.token || current.device !== config.device) throw new BridgeError(0, 'CONFIG_CHANGED', 'Relay credentials changed after sending');
+    if (options.ack > 0 && requireChannelSession(current, options.channel, message.from_session).generation !== message.generation) throw new BridgeError(0, 'SESSION_CHANGED', 'The processed inbox belongs to an earlier generation');
     if (options.ack !== undefined) await client.acknowledgeChannel(options.channel, message.from_session, message.generation, options.ack);
     if (options.watch) {
-      const current = await readConfig();
-      if (current.url !== config.url || current.token !== config.token || current.device !== config.device) throw new BridgeError(0, 'CONFIG_CHANGED', 'Relay credentials changed before watching');
       output(await watchChannel(client, current, options.channel, message.from_session, options.timeout));
     }
   }

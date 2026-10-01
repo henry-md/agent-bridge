@@ -145,6 +145,54 @@ test('send acknowledges processed mail and watches in one process, preserving re
   await assert.rejects(cli(a, ['send', '--to', 'vm', '--text', 'invalid', '--watch'], aSession), (error: unknown) => (error as { stderr: string }).stderr.includes('INVALID_ARGUMENT'));
 });
 
+test('combined send retains its receipt and pending inbox after a failed ack, then deduplicates recovery', { timeout: 30_000 }, async t => {
+  const h = await harness(t); const a = await h.device('laptop'); const b = await h.device('vm');
+  const aSession = randomUUID(); const bSession = randomUUID(); await pair(a, b, '4040', aSession, bSession);
+  const incoming = await cli(b, ['send', '--channel', '4040', '--text', 'question'], bSession);
+  let failAck = true;
+  const url = await httpFixture(t, (req, res) => {
+    let body = ''; req.setEncoding('utf8'); req.on('data', chunk => { body += chunk; }); req.on('end', () => { void (async () => {
+      if (req.url?.endsWith('/ack') && failAck) { failAck = false; res.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: { code: 'test_ack_failure', message: 'Ack failed after send' } })); return; }
+      const response = await h.app.inject({ method: req.method as 'GET' | 'POST', url: req.url!, headers: req.headers, ...(body ? { payload: body } : {}) });
+      res.writeHead(response.statusCode, { 'Content-Type': 'application/json' }).end(response.body);
+    })(); });
+  });
+  const config = JSON.parse(await readFile(a, 'utf8')); await writeFile(a, JSON.stringify({ ...config, url }));
+  const args = ['send', '--channel', '4040', '--text', 'retry-safe answer', '--ack', String(incoming.message.seq)]; let sentId = '';
+  await assert.rejects(cli(a, args, aSession), (error: unknown) => {
+    const failed = error as { stdout: string; stderr: string }; sentId = JSON.parse(failed.stdout).message.id;
+    return failed.stderr.includes('test_ack_failure');
+  });
+  assert.equal((await cli(a, ['inbox', '--channel', '4040', '--wait', '0'], aSession)).messages[0].id, incoming.message.id);
+  const recovered = await cli(a, args, aSession); assert.equal(recovered.message.id, sentId);
+  const received = await cli(b, ['inbox', '--channel', '4040', '--wait', '0'], bSession);
+  assert.equal(received.messages.length, 1); assert.equal(received.messages[0].id, sentId);
+  assert.deepEqual((await cli(a, ['inbox', '--channel', '4040', '--wait', '0'], aSession)).messages, []);
+  await cli(a, ['send', '--channel', '4040', '--text', 'first unbound message', '--ack', '0'], aSession);
+  await cli(a, ['send', '--channel', '4040', '--text', 'second unbound message', '--ack', '0'], aSession);
+});
+
+test('a reply bound to old mail stops on ended generations and configuration changes before ack', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-reply-context-')); t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'config.json'); const session = randomUUID(); const generation = randomUUID();
+  let mode = 'ended'; const requests: string[] = []; let config: Record<string, unknown>;
+  const url = await httpFixture(t, (req, res) => {
+    requests.push(req.url!); let body = ''; req.setEncoding('utf8'); req.on('data', chunk => { body += chunk; }); req.on('end', () => { void (async () => {
+      if (mode === 'ended') { res.writeHead(409, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: { code: 'stale_generation', message: 'Original mail belongs to an ended round' } })); return; }
+      const changed = mode === 'credentials' ? { ...config, token: 'replacement' } : { ...config, channel_sessions: { '4040': { sessions: { [session]: { generation: randomUUID(), secret_word: 'amber-river' } } } } };
+      await writeFile(path, JSON.stringify(changed));
+      const input = JSON.parse(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ message: { ...input, id: randomUUID(), seq: 7, channel: '4040', from: 'laptop', from_session: session, to: 'vm', to_session: randomUUID(), created_at: new Date().toISOString() } }));
+    })(); });
+  });
+  config = { url, token: 'token', device: 'laptop', roots: {}, channel_sessions: { '4040': { sessions: { [session]: { generation, secret_word: 'amber-river' } } } } };
+  for (const [next, code] of [['ended', 'stale_generation'], ['credentials', 'CONFIG_CHANGED'], ['generation', 'SESSION_CHANGED']]) {
+    mode = next!; requests.length = 0; await writeFile(path, JSON.stringify(config));
+    await assert.rejects(cli(path, ['send', '--channel', '4040', '--text', 'answer to processed mail', '--ack', '1'], session), (error: unknown) => (error as { stderr: string }).stderr.includes(code!));
+    assert.deepEqual(requests, ['/v1/channels/4040/messages'], 'Old mail must not rejoin a new generation or acknowledge with changed credentials');
+  }
+});
+
 test('non-Codex invocations save a durable fallback per channel and accept numeric strings beyond ports', { timeout: 20_000 }, async t => {
   const h = await harness(t); const a = await h.device('laptop');
   const initial = await cli(a, ['channel', 'join', '65536', '--wait', '0'], 'not-a-uuid');

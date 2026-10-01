@@ -264,7 +264,7 @@ export async function pairChannel(client: RelayClient, config: BridgeConfig, cha
   } finally { clearTimeout(timer); }
 }
 
-export async function sendChannelMessage(client: RelayClient, config: BridgeConfig, channel: string, sessionId: string | undefined, text: string, fileIds: string[], idempotencyKey: string = randomUUID()): Promise<ChannelMessage> {
+export async function sendChannelMessage(client: RelayClient, config: BridgeConfig, channel: string, sessionId: string | undefined, text: string, fileIds: string[], idempotencyKey: string = randomUUID(), allowRenewal = true): Promise<ChannelMessage> {
   let session = requireChannelSession(config, channel, sessionId);
   const deadline = Date.now() + 60_000;
   for (let attempt = 0; ; attempt++) {
@@ -272,7 +272,10 @@ export async function sendChannelMessage(client: RelayClient, config: BridgeConf
     try { return await client.sendChannel(session.channel, input, idempotencyKey); }
     catch (error) {
       if (!(error instanceof BridgeError) || attempt >= 5 || Date.now() >= deadline) throw error;
-      if (rejoinCodes.has(error.code)) session = await rejoin(client, config, session);
+      if (rejoinCodes.has(error.code)) {
+        if (!allowRenewal) throw error;
+        session = await rejoin(client, config, session);
+      }
       else if (error.code !== 'channel_not_connected') throw error;
       // The peer's watcher confirms a reset pairing within one poll; wait for it rather than failing.
       await channelStatus(client, await readConfig(), session.channel, session.session_id, 25);
