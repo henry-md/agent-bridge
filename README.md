@@ -6,7 +6,7 @@ A small authenticated HTTPS relay for agent messages, selected filesystem contex
 Laptop agent -> bridge CLI -> Railway relay <- VM connector -> shared VM folder
 ```
 
-Both clients connect outward. File requests work while the connector is running, even if that computer's AI agent is idle. Agent messages remain in a mailbox until an active peer checks it. The bridge does not wake an existing chat, invoke a model, or share chat history automatically.
+Both clients connect outward. File requests work while the connector is running, even if that computer's AI agent is idle. Agent messages remain in a mailbox until the peer reads them. `bridge watch` lets a chat keep listening: Claude Code runs it in the background and wakes when it exits, and Codex keeps it running inside its turn. The bridge never launches a model or shares chat history automatically.
 
 ## Live deployment
 
@@ -21,9 +21,9 @@ npx @railway/cli run --service agent-bridge -- node dist/cli.js register laptop
 
 Then select a shared root, install the skill into your participating project, and run `bridge connect` as shown below. Other computers need their own registered token and selected folders.
 
-## Pair two Codex chats on a channel
+## Pair two chats on a channel
 
-After one-time device registration, install the skill on both computers with `bridge skill install --user`. In each active Codex chat, run:
+After one-time device registration, install the skill on both computers: `bridge skill install --user` for Codex and `bridge skill install --claude` for Claude Code. In each active chat, run:
 
 ```text
 /agent-bridge 4040
@@ -37,17 +37,21 @@ The underlying CLI is:
 bridge channel join 4040 --wait 25
 bridge send --channel 4040 --text 'Please inspect the VM export.'
 bridge inbox --channel 4040 --wait 25
+# Block until the next messages arrive, recovering the session as needed.
+bridge watch --channel 4040
 # Process the inbox page before acknowledging its returned cursor.
 bridge channel ack 4040 CURSOR
 bridge channel status 4040
 bridge channel leave 4040
 ```
 
-Codex thread IDs identify separate sessions; other shells use a saved fallback ID per channel. Supply `--session UUID` consistently when running distinct agents that share an environment. There is no global active-channel setting. The relay allows two active sessions from different registered devices per channel and keeps channel messages separate from ordinary device mailboxes. One computer can participate in many different channel numbers concurrently.
+Codex thread IDs identify separate sessions; Claude Code passes `--session` with its session ID, and other shells use a saved fallback ID per channel. Supply `--session UUID` consistently when running distinct agents that share an environment. There is no global active-channel setting. The relay allows two active sessions from different registered devices per channel and keeps channel messages separate from ordinary device mailboxes. One computer can participate in many different channel numbers concurrently.
 
-Inbox reads leave channel messages unacknowledged until `channel ack`; explicit `--after 0` replays the current round. Sessions have a 90-second activity lease, renewed by channel calls. After both expire, joining starts a fresh pairing with a new generation and word. A new peer must acknowledge a fresh handshake; an old word alone cannot prove an active peer. The word is a visual connection check, and bearer tokens still control access. Attachments retain the existing trusted-workspace access model.
+Inbox reads leave channel messages unacknowledged until `channel ack`; explicit `--after 0` replays the current round. Sessions stay joined while idle until they leave (the lease defaults to ten years; set `CHANNEL_LEASE_MS` to shorten it). A newer chat joining from the same device takes the channel over, and the older chat's calls fail with `channel_session_replaced`. A new peer must acknowledge a fresh handshake; an old word alone cannot prove an active peer. `bridge watch` and `bridge send` confirm a reset pairing automatically. The word is a visual connection check, and bearer tokens still control access. Attachments retain the existing trusted-workspace access model.
 
-A file connector is needed for remote folder reads, but channel pairing and messages work without it. The skill does not wake idle Codex chats or launch agents automatically.
+`bridge watch --channel N` exits as soon as unacknowledged messages arrive, or with `"timed_out": true` after `--timeout SECONDS`. It rejoins an expired session with the same identity and retries through network failures and relay restarts. Claude Code wakes an idle chat when a background command finishes, so the skill runs the watcher in the background. Codex does not, so the skill keeps a foreground watch loop running inside the turn.
+
+A file connector is needed for remote folder reads, but channel pairing and messages work without it. The skill never launches agents automatically.
 
 ## Build and run locally
 
@@ -145,6 +149,7 @@ For CLI deployment after `npx @railway/cli login`, use `railway init`, add the s
 | `PORT` | `3000` | Railway supplies this automatically |
 | `MAX_UPLOAD_BYTES` | `26214400` | 25 MiB maximum individual file |
 | `UPLOAD_QUOTA_BYTES` | `1073741824` | 1 GiB total completed and in-progress upload quota |
+| `CHANNEL_LEASE_MS` | `315360000000` | Channel session lease (ten years), renewed by every channel call |
 
 For hundreds-of-megabytes or gigabyte transfers, add direct private object-storage uploads and resumable multipart transfer in a later version. Raising the application cap alone does not remove Railway's five-minute upload deadline.
 

@@ -5,11 +5,11 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { BridgeError, channelMessageInputSchema, messageInputSchema, nameSchema, requestInputSchema } from './shared/protocol.js';
+import { BridgeError, messageInputSchema, nameSchema, requestInputSchema } from './shared/protocol.js';
 import { configPath, readConfig, tokenFromEnv, updateConfig, type BridgeConfig } from './client/config.js';
 import { RelayClient, validateRelayUrl } from './client/relay.js';
 import { runConnector } from './client/connector.js';
-import { channelId, channelResult, channelStatus, joinChannel, leaveChannel, requireChannelSession } from './client/channel.js';
+import { channelId, channelResult, channelStatus, joinChannel, leaveChannel, requireChannelSession, sendChannelMessage, watchChannel } from './client/channel.js';
 
 const program = new Command().name('bridge').description('Exchange messages and file context through your private Railway relay').version('0.1.0');
 program.configureOutput({ outputError: () => {} });
@@ -81,7 +81,7 @@ program.command('send').option('--to <device>', 'Recipient for the device mailbo
   if (!options.channel && !options.to) throw new BridgeError(0, 'INVALID_ARGUMENT', 'Specify --channel or --to');
   if (options.session && !options.channel) throw new BridgeError(0, 'INVALID_ARGUMENT', '--session requires --channel');
   const { config, client } = await localClient();
-  if (options.channel) { const session = requireChannelSession(config, options.channel, options.session); const input = channelMessageInputSchema.parse({ session_id: session.session_id, generation: session.generation, text: options.text, file_ids: options.attach }); output({ message: await client.sendChannel(session.channel, input, options.idempotencyKey) }); }
+  if (options.channel) output({ message: await sendChannelMessage(client, config, options.channel, options.session, options.text, options.attach, options.idempotencyKey) });
   else { const input = messageInputSchema.parse({ to: options.to, text: options.text, file_ids: options.attach }); output({ message: await client.send(input, options.idempotencyKey) }); }
 });
 program.command('inbox').option('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID for --channel').option('--wait <seconds>', 'Long poll wait, 0–25 seconds', wait, 25).option('--after <cursor>', 'Replay after this cursor for this call', integer).action(async options => {
@@ -96,16 +96,19 @@ program.command('inbox').option('--channel <channel>', 'Paired numeric channel',
     return { ...current, inbox_cursor: Math.max(current.inbox_cursor ?? 0, page.cursor) };
   });
 });
+program.command('watch').description('Wait for the next channel messages, rejoining and reconfirming as needed; exits once messages arrive').requiredOption('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').option('--timeout <seconds>', 'Give up after this many seconds; 0 waits indefinitely', integer, 0).action(async options => {
+  const { config, client } = await localClient(); output(await watchChannel(client, config, options.channel, options.session, options.timeout));
+});
 program.command('upload').argument('<path>').action(async path => { const { client } = await localClient(); output({ file: await client.upload(path) }); });
 program.command('download').argument('<id>').requiredOption('--output <path>', 'New destination path; existing files are never overwritten').action(async (id, options) => { const { client } = await localClient(); const file = await client.download(id, options.output); output({ file, path: resolve(options.output) }); });
 program.command('files').action(async () => { const { client } = await localClient(); output({ files: await client.files() }); });
 program.command('file').argument('<id>').action(async id => { const { client } = await localClient(); output({ file: await client.file(id) }); });
 program.command('delete').argument('<id>').action(async id => { const { client } = await localClient(); output(await client.deleteFile(id)); });
-program.command('skill').command('install').option('--project <path>', 'Install inside a project checkout').option('--user', 'Install for this user (default)').option('--force', 'Replace an existing skill folder').action(async options => {
-  if (options.project && options.user) throw new BridgeError(0, 'INVALID_ARGUMENT', '--user and --project are mutually exclusive');
+program.command('skill').command('install').option('--project <path>', 'Install inside a project checkout').option('--user', 'Install for this Codex user (default)').option('--claude', 'Install for this Claude Code user').option('--force', 'Replace an existing skill folder').action(async options => {
+  if ([options.project, options.user, options.claude].filter(Boolean).length > 1) throw new BridgeError(0, 'INVALID_ARGUMENT', '--user, --claude and --project are mutually exclusive');
   let destination: string;
   if (options.project) { const project = await realpath(resolve(options.project)); if (!(await stat(project)).isDirectory()) throw new BridgeError(0, 'NOT_A_DIRECTORY', 'Project must be a directory'); destination = resolve(project, '.agents/skills/agent-bridge'); }
-  else destination = resolve(homedir(), '.codex/skills/agent-bridge');
+  else destination = resolve(homedir(), options.claude ? '.claude/skills/agent-bridge' : '.codex/skills/agent-bridge');
   const source = resolve(dirname(fileURLToPath(import.meta.url)), '../.agents/skills/agent-bridge');
   await mkdir(dirname(destination), { recursive: true });
   const staging = `${destination}.${randomUUID()}.tmp`; const backup = `${destination}.${randomUUID()}.backup`; const lock = `${destination}.install-lock`;
@@ -129,7 +132,7 @@ program.command('skill').command('install').option('--project <path>', 'Install 
     try { await rm(staging, { recursive: true, force: true }); if (installed && backedUp) await rm(backup, { recursive: true, force: true }); }
     finally { await rm(lock, { recursive: true, force: true }); }
   }
-  output({ installed: resolve(destination, 'SKILL.md'), scope: options.project ? 'project' : 'user' });
+  output({ installed: resolve(destination, 'SKILL.md'), scope: options.project ? 'project' : options.claude ? 'claude' : 'user' });
 });
 try { await program.parseAsync(); } catch (error) {
   const commander = error as { code?: string; exitCode?: number };

@@ -116,7 +116,13 @@ test('channel sessions enforce authentication, distinct devices, two members and
   const { a, b } = await f.pair(first, second);
   assert.equal((await f.app.inject({ method: 'POST', url: '/v1/channels/4040/join', payload: { session_id: randomUUID(), secret_word: 'word-one' } })).statusCode, 401);
   const extra = (token: string, session_id = randomUUID()) => f.app.inject({ method: 'POST', url: '/v1/channels/4040/join', headers: auth(token), payload: { session_id, secret_word: 'word-one' } });
-  assert.equal((await extra(first)).json().error.code, 'device_already_joined');
+  const takeover = await extra(first);
+  assert.equal(takeover.statusCode, 200, takeover.body);
+  assert.equal(takeover.json().generation, a.generation, 'a newer chat on the same device keeps the round');
+  assert.deepEqual(takeover.json().peer, { device: 'second', session_id: b.session_id });
+  assert.equal((await f.inbox(first, a)).json().error.code, 'channel_session_replaced');
+  assert.equal((await f.send(first, a, 'superseded')).json().error.code, 'channel_session_replaced');
+  assert.equal((await f.status(second, b)).status, 'waiting', 'the peer must confirm the replacement chat');
   assert.equal((await extra(outsider)).json().error.code, 'channel_full');
   assert.equal((await extra(outsider, a.session_id)).statusCode, 403);
   for (const token of [second, outsider]) {
@@ -291,6 +297,41 @@ test('a peer arriving before status polling returns immediately for the callers 
   assert.equal(current.pairing_id, b.pairing_id);
   assert.equal((await f.confirm(first, current)).status, 'waiting');
   assert.equal((await f.confirm(second, b)).status, 'connected');
+});
+
+test('default sessions stay paired through long idle periods', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const f = await fixture(t);
+  const first = await f.register('first');
+  const second = await f.register('second');
+  const { a, b } = await f.pair(first, second);
+  t.mock.timers.tick(30 * 24 * 60 * 60 * 1000);
+  assert.equal((await f.status(first, a)).status, 'connected');
+  assert.equal((await f.send(second, b, 'after a month')).statusCode, 200);
+  assert.equal((await f.inbox(first, a)).json().messages[0].text, 'after a month');
+});
+
+test('an inbox long poll returns early when the pairing resets so the reader can reconfirm', async t => {
+  const f = await fixture(t);
+  const first = await f.register('first');
+  const second = await f.register('second');
+  const { a, b } = await f.pair(first, second);
+  let settled = false;
+  const pending = f.app.inject({ url: `/v1/channels/4040/messages?${f.query(a)}&wait=5`, headers: auth(first) })
+    .then(response => { settled = true; return response; });
+  await delay(30);
+  assert.equal(settled, false);
+  const replacement = await f.joinChannel(second, '4040', randomUUID(), 'ignored-proposal');
+  assert.notEqual(replacement.session_id, b.session_id);
+  await delay(300);
+  assert.equal(settled, true, 'the reader learns about the new pairing without waiting out its poll');
+  const early = await pending;
+  assert.equal(early.statusCode, 200, early.body);
+  assert.deepEqual(early.json().messages, []);
+  assert.equal((await f.confirm(first, a)).status, 'waiting');
+  assert.equal((await f.confirm(second, replacement)).status, 'connected');
+  assert.equal((await f.send(first, a, 'to the new chat')).statusCode, 200);
+  assert.equal((await f.inbox(second, replacement)).json().messages[0].text, 'to the new chat');
 });
 
 test('delayed confirmations are fenced across peer replacement and same-session rejoining', async t => {

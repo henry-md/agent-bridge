@@ -99,6 +99,39 @@ test('repeating join renews an expired membership using the same saved chat iden
   assert.equal(JSON.parse(await readFile(a, 'utf8')).channel_sessions['4040'].sessions[first.session_id], undefined);
 });
 
+test('watch wakes on the next message, honours its timeout and stops after another chat takes over', { timeout: 90_000 }, async t => {
+  const h = await harness(t); const a = await h.device('laptop'); const b = await h.device('vm');
+  const aSession = randomUUID(); const bSession = randomUUID();
+  await pair(a, b, '4040', aSession, bSession);
+  const watching = cli(b, ['watch', '--channel', '4040'], bSession);
+  await delay(500);
+  await cli(a, ['send', '--channel', '4040', '--text', 'wake up'], aSession);
+  const woke = await watching;
+  assert.equal(woke.timed_out, false); assert.equal(woke.session_id, bSession);
+  assert.deepEqual(woke.messages.map((message: { text: string }) => message.text), ['wake up']);
+  await cli(b, ['channel', 'ack', '4040', String(woke.cursor)], bSession);
+  const idle = await cli(b, ['watch', '--channel', '4040', '--timeout', '1'], bSession);
+  assert.equal(idle.timed_out, true); assert.deepEqual(idle.messages, []);
+  const newer = randomUUID();
+  const takeover = await cli(b, ['channel', 'join', '4040', '--wait', '0'], newer);
+  assert.equal(takeover.session_id, newer); assert.equal(takeover.peer.session_id, aSession);
+  await assert.rejects(cli(b, ['watch', '--channel', '4040', '--timeout', '1'], bSession), (error: unknown) => (error as { stderr: string }).stderr.includes('channel_session_replaced'));
+  const sent = await cli(a, ['send', '--channel', '4040', '--text', 'hello new chat'], aSession);
+  assert.equal(sent.message.to_session, newer, 'send confirms the replacement pairing instead of failing');
+  assert.equal((await cli(b, ['inbox', '--channel', '4040', '--wait', '0'], newer)).messages[0].text, 'hello new chat');
+});
+
+test('watch rejoins an expired session under the same chat identity', { timeout: 30_000 }, async t => {
+  const h = await harness(t, { channelLeaseMs: 1500 }); const a = await h.device('laptop');
+  const session = randomUUID();
+  const first = await cli(a, ['channel', 'join', '4040', '--wait', '0'], session);
+  await delay(2000);
+  const idle = await cli(a, ['watch', '--channel', '4040', '--timeout', '3'], session);
+  assert.equal(idle.timed_out, true); assert.equal(idle.session_id, session);
+  const saved = JSON.parse(await readFile(a, 'utf8')).channel_sessions['4040'].sessions[session];
+  assert.notEqual(saved.generation, first.generation, 'the expired round was replaced by a fresh join');
+});
+
 async function httpFixture(t: TestContext, handle: (req: IncomingMessage, res: ServerResponse) => void) {
   const server = httpServer(handle); server.listen(0, '127.0.0.1'); await once(server, 'listening');
   t.after(async () => { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); });
@@ -181,4 +214,7 @@ test('skill installs the full folder for the user by default and protects existi
   const project = join(directory, 'project'); await mkdir(project);
   await cli(config, ['skill', 'install', '--project', project], '', env); assert.ok((await readFile(join(project, '.agents/skills/agent-bridge/agents/openai.yaml'), 'utf8')).length);
   await assert.rejects(cli(config, ['skill', 'install', '--user', '--project', project], '', env), (error: unknown) => (error as { stderr: string }).stderr.includes('mutually exclusive'));
+  const claude = await cli(config, ['skill', 'install', '--claude'], '', env);
+  assert.equal(claude.installed, join(directory, '.claude/skills/agent-bridge', 'SKILL.md')); assert.equal(claude.scope, 'claude');
+  await assert.rejects(cli(config, ['skill', 'install', '--claude', '--user'], '', env), (error: unknown) => (error as { stderr: string }).stderr.includes('mutually exclusive'));
 });

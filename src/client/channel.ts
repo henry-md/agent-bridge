@@ -1,7 +1,7 @@
 import { randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { BridgeError, channelIdSchema, type ChannelStatus } from '../shared/protocol.js';
-import { updateConfig, type BridgeConfig, type ChannelSessionConfig } from './config.js';
+import { BridgeError, channelIdSchema, channelMessageInputSchema, type ChannelInbox, type ChannelMessage, type ChannelStatus } from '../shared/protocol.js';
+import { readConfig, updateConfig, type BridgeConfig, type ChannelSessionConfig } from './config.js';
 import { RelayClient } from './relay.js';
 
 const uuidSchema = z.string().uuid();
@@ -101,6 +101,55 @@ export async function leaveChannel(client: RelayClient, config: BridgeConfig, ch
     return { ...current, channel_sessions: { ...current.channel_sessions, [session.channel]: { ...saved, sessions } } };
   });
   return session;
+}
+// An expired session or ended round is rejoined under the same chat identity.
+const rejoinCodes = new Set(['channel_session_expired', 'stale_generation']);
+// Network failures, relay restarts and pairing churn pass; authentication and identity errors do not.
+function transientFailure(error: unknown): boolean {
+  if (error instanceof BridgeError) return error.status >= 500 || error.status === 429 || error.code === 'channel_pairing_changed';
+  return error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError' || (error instanceof TypeError && error.message === 'fetch failed'));
+}
+const pause = (ms: number) => new Promise(resolvePromise => setTimeout(resolvePromise, ms));
+async function rejoin(client: RelayClient, config: BridgeConfig, session: LocalChannelSession): Promise<LocalChannelSession & { generation: string }> {
+  await joinChannel(client, config, session.channel, session.session_id, 0);
+  return requireChannelSession(await readConfig(), session.channel, session.session_id);
+}
+export interface WatchResult extends ChannelInbox { channel: string; session_id: string; timed_out: boolean }
+export async function watchChannel(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string, timeoutSeconds = 0): Promise<WatchResult> {
+  const deadline = timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : Infinity;
+  let session = requireChannelSession(config, channel, sessionId);
+  let page: ChannelInbox | undefined; let needsRejoin = false; let failures = 0;
+  while (Date.now() < deadline) {
+    try {
+      if (needsRejoin) { session = await rejoin(client, config, session); needsRejoin = false; }
+      // A peer that rejoined or replaced its chat resets the pairing; confirm it so both sides can keep sending.
+      const status = await client.channelStatus(session.channel, session.session_id, session.generation, 0);
+      if (status.peer && status.status !== 'connected') await confirmStatus(client, status);
+      page = await client.channelInbox(session.channel, session.session_id, session.generation, undefined, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
+      failures = 0;
+      if (page.messages.length) return { ...page, channel: session.channel, session_id: session.session_id, timed_out: false };
+    } catch (error) {
+      if (error instanceof BridgeError && rejoinCodes.has(error.code)) { needsRejoin = true; continue; }
+      if (!transientFailure(error)) throw error;
+      failures++; await pause(Math.min(30_000, 1000 * 2 ** Math.min(failures, 5)));
+    }
+  }
+  return { messages: [], cursor: page?.cursor ?? 0, acknowledged_cursor: page?.acknowledged_cursor ?? 0, channel: session.channel, session_id: session.session_id, timed_out: true };
+}
+export async function sendChannelMessage(client: RelayClient, config: BridgeConfig, channel: string, sessionId: string | undefined, text: string, fileIds: string[], idempotencyKey = randomUUID()): Promise<ChannelMessage> {
+  let session = requireChannelSession(config, channel, sessionId);
+  const deadline = Date.now() + 60_000;
+  for (let attempt = 0; ; attempt++) {
+    const input = channelMessageInputSchema.parse({ session_id: session.session_id, generation: session.generation, text, file_ids: fileIds });
+    try { return await client.sendChannel(session.channel, input, idempotencyKey); }
+    catch (error) {
+      if (!(error instanceof BridgeError) || attempt >= 5 || Date.now() >= deadline) throw error;
+      if (rejoinCodes.has(error.code)) session = await rejoin(client, config, session);
+      else if (error.code !== 'channel_not_connected') throw error;
+      // The peer's watcher confirms a reset pairing within one poll; wait for it rather than failing.
+      await channelStatus(client, await readConfig(), session.channel, session.session_id, 25);
+    }
+  }
 }
 export function channelResult(status: ChannelStatus): ChannelStatus & { confirmation: string } {
   return { ...status, confirmation: status.status === 'connected' ? `Connected on channel ${status.channel}. Secret word is ${status.secret_word}.` : `Waiting for peer on channel ${status.channel}.` };

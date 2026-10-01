@@ -18,6 +18,7 @@ try {
     requestTtlMs: positiveNumber('REQUEST_TTL_MS'),
     offlineMs: positiveNumber('OFFLINE_MS'),
     leaseMs: positiveNumber('LEASE_MS'),
+    channelLeaseMs: positiveNumber('CHANNEL_LEASE_MS'),
   });
   const port = positiveNumber('PORT') ?? 3000;
   if (port > 65535) throw new Error('PORT must be less than 65536');

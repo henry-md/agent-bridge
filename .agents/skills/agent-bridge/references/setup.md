@@ -2,7 +2,7 @@
 
 The relay origin is `https://agent-bridge-production-2405.up.railway.app`. Use a distinct registered device token on each computer. The source is https://github.com/henry-md/agent-bridge. Node.js 24 or newer is required.
 
-If the CLI is unavailable, locate an existing checkout of `agent-bridge` first. Otherwise clone that repository into the user's developer directory. In the checkout run `npm ci`, `npm run build`, and `npm link`. Use `node /absolute/path/to/agent-bridge/dist/cli.js` if the linked command is not yet on PATH. Install this skill for all projects with `bridge skill install --user`; use `--force` only to update this same skill. Project-local installation remains available with `--project PATH`.
+If the CLI is unavailable, locate an existing checkout of `agent-bridge` first. Otherwise clone that repository into the user's developer directory. In the checkout run `npm ci`, `npm run build`, and `npm link`. Use `node /absolute/path/to/agent-bridge/dist/cli.js` if the linked command is not yet on PATH. Install this skill for all Codex projects with `bridge skill install --user`, and for Claude Code with `bridge skill install --claude`; use `--force` only to update this same skill. Project-local installation remains available with `--project PATH`. If the checkout path contains `&` on Windows, npm scripts fail inside `cmd.exe`; run `node node_modules/typescript/bin/tsc -p tsconfig.json` instead of `npm run build`.
 
 Check `bridge config show`, which redacts the token. Configure the origin with `bridge config set --url https://agent-bridge-production-2405.up.railway.app`. Keep the default configuration in the user's profile, outside Git.
 

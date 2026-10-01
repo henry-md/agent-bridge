@@ -30,6 +30,9 @@ export interface ServerOptions {
 }
 
 interface Actor { name: string; hash: string }
+export const DEFAULT_CHANNEL_LEASE_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+// A replaced member keeps this lease so its chat learns it was superseded rather than expired.
+const REPLACED_LEASE = -1;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const waitSchema = z.object({ wait: z.coerce.number().int().min(0).max(25).default(0) });
 const messageQuerySchema = waitSchema.extend({ after: z.coerce.number().int().min(0).default(0) });
@@ -50,7 +53,8 @@ export async function createServer(options: ServerOptions) {
   const requestTtlMs = options.requestTtlMs ?? 60_000;
   const offlineMs = options.offlineMs ?? 60_000;
   const leaseMs = options.leaseMs ?? 30_000;
-  const channelLeaseMs = options.channelLeaseMs ?? 90_000;
+  // Channel sessions persist until a chat leaves or is replaced; idle chats keep their pairing.
+  const channelLeaseMs = options.channelLeaseMs ?? DEFAULT_CHANNEL_LEASE_MS;
   for (const [name, value] of Object.entries({ maxUploadBytes, quotaBytes, requestTtlMs, offlineMs, leaseMs, channelLeaseMs })) {
     if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
   }
@@ -178,6 +182,7 @@ export async function createServer(options: ServerOptions) {
   function channelMember(round: Row, session: string, who: Actor, now: number, renew = true): Row {
     const row = db.prepare('SELECT * FROM channel_members WHERE generation = ? AND session_id = ?').get(round.generation, session) as Row | undefined;
     if (!row || row.device_name !== who.name) throw new BridgeError(403, 'channel_session_mismatch', 'This session does not belong to the authenticated device');
+    if (row.lease_until === REPLACED_LEASE) throw new BridgeError(409, 'channel_session_replaced', 'Another chat on this device took over this channel');
     if (row.lease_until <= now) throw new BridgeError(409, 'channel_session_expired', 'This channel session has expired; join again');
     if (renew) {
       row.lease_until = now + channelLeaseMs;
@@ -290,8 +295,14 @@ export async function createServer(options: ServerOptions) {
       const current = round!;
       const prior = db.prepare('SELECT * FROM channel_members WHERE generation = ? AND session_id = ?').get(current.generation, input.session_id) as Row | undefined;
       if (prior && prior.device_name !== who.name) throw new BridgeError(403, 'channel_session_mismatch', 'This session belongs to another device');
-      const sameDevice = members.find(row => row.device_name === who.name);
-      if (sameDevice && sameDevice.session_id !== input.session_id) throw new BridgeError(409, 'device_already_joined', 'This device already has an active session in the channel');
+      let sameDevice = members.find(row => row.device_name === who.name);
+      if (sameDevice && sameDevice.session_id !== input.session_id) {
+        // Sessions no longer lapse on their own, so the newest chat on a device takes the channel over.
+        db.prepare('UPDATE channel_members SET lease_until = ?, confirmed_peer_session = NULL WHERE generation = ? AND session_id = ?')
+          .run(REPLACED_LEASE, current.generation, sameDevice.session_id);
+        members = members.filter(row => row.session_id !== sameDevice!.session_id);
+        sameDevice = undefined;
+      }
       if (!sameDevice) {
         if (members.length >= 2) throw new BridgeError(409, 'channel_full', 'This channel already has two active devices');
         resetChannelPairing(current);
@@ -397,16 +408,23 @@ export async function createServer(options: ServerOptions) {
     const channel = channelParam(request);
     const input = channelInboxQuerySchema.parse(request.query);
     const who = actor(request);
+    let initialPairing: string | undefined;
+    let pairing: string | undefined;
     return poll(request, reply, input.wait, () => transaction(() => {
       const now = Date.now();
       const round = channelRound(channel, input.generation);
       expireChannelMembers(round, now);
       const member = channelMember(round, input.session_id, who, now);
+      pairing = round.pairing_id;
       const after = input.after ?? member.acknowledged_cursor;
       const rows = db.prepare('SELECT * FROM channel_messages WHERE generation = ? AND to_name = ? AND to_session = ? AND seq > ? ORDER BY seq LIMIT 100')
         .all(input.generation, who.name, input.session_id, after) as Row[];
       return { messages: rows.map(channelMessageInfo), cursor: rows.at(-1)?.seq ?? after, acknowledged_cursor: member.acknowledged_cursor };
-    }), value => value.messages.length > 0, Math.max(1, Math.min(250, Math.floor(channelLeaseMs / 3))));
+    }), value => {
+      initialPairing ??= pairing;
+      // Return early when the pairing resets so a watching reader can confirm the new peer promptly.
+      return value.messages.length > 0 || pairing !== initialPairing;
+    }, Math.max(1, Math.min(250, Math.floor(channelLeaseMs / 3))));
   });
   app.post('/v1/channels/:channel/ack', { preHandler: requireDevice }, async request => {
     const channel = channelParam(request);
