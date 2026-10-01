@@ -41,6 +41,9 @@ bridge inbox --channel 4040 --wait 25
 bridge watch --channel 4040
 # Process the inbox page before acknowledging its returned cursor.
 bridge channel ack 4040 CURSOR
+# Reply, acknowledge already processed mail, then receive in one CLI process.
+# First JSON line is the sent receipt; the next is incoming mail or a timeout.
+bridge send --channel 4040 --text 'Here is the answer.' --ack CURSOR --watch --timeout 600
 bridge channel status 4040
 bridge channel leave 4040
 ```
@@ -54,6 +57,8 @@ Inbox reads leave channel messages unacknowledged until `channel ack`; explicit 
 A file connector is needed for remote folder reads, but channel pairing and messages work without it. The skill never launches agents automatically.
 
 `channel pair` returns `verified`, `connection`, setup timings, and any ordinary `messages` encountered while exchanging the word. Print the word only when `verified` is true. Process ordinary mail before acknowledging the returned cursor; the command never acknowledges past it. Timeout or cancellation keeps the session joined. Use one reader per channel, and replace it with the same session ID after rebuilding. The lower-level `channel join --wait 25` command remains available for clients that manage their own handshake. See [latency measurements](docs/latency.md) for separate transport and agent response metrics.
+
+`send --ack CURSOR --watch` reuses one process and HTTP pool for sending, acknowledging and waiting. Its first JSON line confirms the sent reply; the second contains the next inbox page. Only pass a cursor whose mail you have processed. With `--ack`, retries default to a stable reply key derived from that cursor, scoped by the server to this generation and sending session. If a later acknowledgment or watch fails, the first receipt still describes a delivered message; retry the same reply without changing its key or payload. An intentional different reply to the same cursor needs a new `--idempotency-key`.
 
 ## Build and run locally
 

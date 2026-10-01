@@ -83,12 +83,23 @@ channels.command('leave').argument('<channel>', 'Canonical numeric channel', cha
 channels.command('ack').argument('<channel>', 'Canonical numeric channel', channelId).argument('<cursor>', 'Inbox cursor processed successfully', integer).option('--session <uuid>', 'Chat session UUID').action(async (channel, cursor, options) => {
   const { config, client } = await localClient(); const session = requireChannelSession(config, channel, options.session); output(await client.acknowledgeChannel(session.channel, session.session_id, session.generation, cursor));
 });
-program.command('send').option('--to <device>', 'Recipient for the device mailbox').option('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID for --channel').option('--text <text>', 'Message text', '').option('--attach <file-id>', 'Attach file ID; repeat for multiple files', (value: string, previous: string[]) => [...previous, value], [] as string[]).option('--idempotency-key <key>').action(async options => {
+program.command('send').option('--to <device>', 'Recipient for the device mailbox').option('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID for --channel').option('--text <text>', 'Message text', '').option('--attach <file-id>', 'Attach file ID; repeat for multiple files', (value: string, previous: string[]) => [...previous, value], [] as string[]).option('--idempotency-key <key>').option('--ack <cursor>', 'Acknowledge processed channel mail after sending; retries default to a key derived from this cursor', integer).option('--watch', 'Then wait for incoming channel mail in this same process; prints a second JSON line').option('--timeout <seconds>', 'Watch deadline; 0 waits indefinitely', channelTimeout, 0).action(async options => {
   if (options.channel && options.to) throw new BridgeError(0, 'INVALID_ARGUMENT', '--channel and --to are mutually exclusive');
   if (!options.channel && !options.to) throw new BridgeError(0, 'INVALID_ARGUMENT', 'Specify --channel or --to');
   if (options.session && !options.channel) throw new BridgeError(0, 'INVALID_ARGUMENT', '--session requires --channel');
+  if ((options.ack !== undefined || options.watch) && !options.channel) throw new BridgeError(0, 'INVALID_ARGUMENT', '--ack and --watch require --channel');
   const { config, client } = await localClient();
-  if (options.channel) output({ message: await sendChannelMessage(client, config, options.channel, options.session, options.text, options.attach, options.idempotencyKey) });
+  if (options.channel) {
+    const key = options.idempotencyKey ?? (options.ack === undefined ? undefined : `reply:${options.ack}`);
+    const message = await sendChannelMessage(client, config, options.channel, options.session, options.text, options.attach, key);
+    output({ message });
+    if (options.ack !== undefined) await client.acknowledgeChannel(options.channel, message.from_session, message.generation, options.ack);
+    if (options.watch) {
+      const current = await readConfig();
+      if (current.url !== config.url || current.token !== config.token || current.device !== config.device) throw new BridgeError(0, 'CONFIG_CHANGED', 'Relay credentials changed before watching');
+      output(await watchChannel(client, current, options.channel, message.from_session, options.timeout));
+    }
+  }
   else { const input = messageInputSchema.parse({ to: options.to, text: options.text, file_ids: options.attach }); output({ message: await client.send(input, options.idempotencyKey) }); }
 });
 program.command('inbox').option('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID for --channel').option('--wait <seconds>', 'Long poll wait, 0–25 seconds', wait, 25).option('--after <cursor>', 'Replay after this cursor for this call', integer).action(async options => {

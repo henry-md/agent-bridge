@@ -264,7 +264,7 @@ export async function pairChannel(client: RelayClient, config: BridgeConfig, cha
   } finally { clearTimeout(timer); }
 }
 
-export async function sendChannelMessage(client: RelayClient, config: BridgeConfig, channel: string, sessionId: string | undefined, text: string, fileIds: string[], idempotencyKey = randomUUID()): Promise<ChannelMessage> {
+export async function sendChannelMessage(client: RelayClient, config: BridgeConfig, channel: string, sessionId: string | undefined, text: string, fileIds: string[], idempotencyKey: string = randomUUID()): Promise<ChannelMessage> {
   let session = requireChannelSession(config, channel, sessionId);
   const deadline = Date.now() + 60_000;
   for (let attempt = 0; ; attempt++) {

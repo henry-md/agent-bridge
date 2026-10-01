@@ -127,6 +127,24 @@ test('parallel chat channels merge configuration and keep messages and acknowled
   await assert.rejects(cli(a, ['send', '--channel', '0', '--to', 'vm', '--text', 'invalid'], a1), (error: unknown) => (error as { stderr: string }).stderr.includes('mutually exclusive'));
 });
 
+test('send acknowledges processed mail and watches in one process, preserving reply identity on retry', { timeout: 30_000 }, async t => {
+  const h = await harness(t); const a = await h.device('laptop'); const b = await h.device('vm');
+  const aSession = randomUUID(); const bSession = randomUUID(); await pair(a, b, '4040', aSession, bSession);
+  const incoming = await cli(b, ['send', '--channel', '4040', '--text', 'question'], bSession);
+  const args = ['--import', 'tsx', 'src/cli.ts', 'send', '--channel', '4040', '--text', 'answer', '--ack', String(incoming.message.seq), '--watch', '--timeout', '5'];
+  const responding = run(process.execPath, args, { cwd: process.cwd(), env: { ...process.env, CODEX_THREAD_ID: aSession, BRIDGE_CONFIG: a }, timeout: 15_000 });
+  const received = await cli(b, ['watch', '--channel', '4040', '--timeout', '5'], bSession);
+  assert.equal(received.messages[0].text, 'answer');
+  await cli(b, ['channel', 'ack', '4040', String(received.cursor)], bSession);
+  await cli(b, ['send', '--channel', '4040', '--text', 'next question'], bSession);
+  const output = (await responding).stdout.trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(output.length, 2); assert.equal(output[0].message.id, received.messages[0].id);
+  assert.equal(output[1].messages[0].text, 'next question'); assert.equal(output[1].acknowledged_cursor, incoming.message.seq);
+  const retried = await cli(a, ['send', '--channel', '4040', '--text', 'answer', '--ack', String(incoming.message.seq)], aSession);
+  assert.equal(retried.message.id, output[0].message.id); assert.deepEqual((await cli(b, ['inbox', '--channel', '4040', '--wait', '0'], bSession)).messages, []);
+  await assert.rejects(cli(a, ['send', '--to', 'vm', '--text', 'invalid', '--watch'], aSession), (error: unknown) => (error as { stderr: string }).stderr.includes('INVALID_ARGUMENT'));
+});
+
 test('non-Codex invocations save a durable fallback per channel and accept numeric strings beyond ports', { timeout: 20_000 }, async t => {
   const h = await harness(t); const a = await h.device('laptop');
   const initial = await cli(a, ['channel', 'join', '65536', '--wait', '0'], 'not-a-uuid');
