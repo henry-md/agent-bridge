@@ -21,6 +21,30 @@ export const messageInputSchema = z.object({
   file_ids: z.array(z.string().uuid()).max(16).default([]),
 }).strict().refine(x => !!x.text || x.file_ids.length > 0, { message: 'Message needs text or attachments' });
 export type MessageInput = z.infer<typeof messageInputSchema>;
+export const channelIdSchema = z.string().regex(/^(0|[1-9][0-9]{0,63})$/);
+export const channelJoinSchema = z.object({
+  session_id: z.string().uuid(),
+  secret_word: z.string().regex(/^[a-z0-9-]{3,80}$/),
+}).strict();
+export const channelConfirmSchema = channelJoinSchema.extend({ generation: z.string().uuid(), pairing_id: z.string().uuid() });
+export const channelMessageInputSchema = z.object({
+  session_id: z.string().uuid(),
+  generation: z.string().uuid(),
+  text: z.string().max(16000).default(''),
+  file_ids: z.array(z.string().uuid()).max(16).default([]),
+}).strict().refine(x => !!x.text || x.file_ids.length > 0, { message: 'Message needs text or attachments' });
+export type ChannelMessageInput = z.infer<typeof channelMessageInputSchema>;
+export interface ChannelStatus {
+  channel: string; generation: string; pairing_id: string; session_id: string; secret_word: string;
+  status: 'waiting' | 'connected'; peer: { device: string; session_id: string } | null;
+  lease_expires_at: string;
+}
+export interface ChannelMessage {
+  id: string; seq: number; channel: string; generation: string;
+  from: string; from_session: string; to: string; to_session: string;
+  text: string; file_ids: string[]; created_at: string;
+}
+export interface ChannelInbox { messages: ChannelMessage[]; cursor: number; acknowledged_cursor: number }
 export interface Device { name: string; roots: string[]; last_seen: string | null; online: boolean; revoked: boolean }
 export interface Message extends MessageInput { id: string; seq: number; from: string; created_at: string }
 export interface FileInfo { id: string; name: string; size: number; sha256: string; content_type: string; uploaded_by: string; created_at: string }

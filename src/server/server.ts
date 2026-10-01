@@ -12,9 +12,10 @@ import { backup } from 'node:sqlite';
 import { z } from 'zod';
 import {
   BridgeError, DEFAULT_QUOTA_BYTES, DEFAULT_UPLOAD_BYTES,
-  messageInputSchema, nameSchema, requestInputSchema,
+  channelConfirmSchema, channelIdSchema, channelJoinSchema, channelMessageInputSchema,
+  messageInputSchema, nameSchema, requestInputSchema, type ChannelStatus,
 } from '../shared/protocol.js';
-import { deviceInfo, fileInfo, messageInfo, openDatabase, requestInfo, type Row } from './database.js';
+import { channelMessageInfo, deviceInfo, fileInfo, messageInfo, openDatabase, requestInfo, type Row } from './database.js';
 
 export interface ServerOptions {
   dataDir: string;
@@ -25,12 +26,17 @@ export interface ServerOptions {
   requestTtlMs?: number;
   offlineMs?: number;
   leaseMs?: number;
+  channelLeaseMs?: number;
 }
 
 interface Actor { name: string; hash: string }
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const waitSchema = z.object({ wait: z.coerce.number().int().min(0).max(25).default(0) });
 const messageQuerySchema = waitSchema.extend({ after: z.coerce.number().int().min(0).default(0) });
+const channelSessionSchema = z.object({ session_id: z.string().uuid(), generation: z.string().uuid() }).strict();
+const channelStatusQuerySchema = channelSessionSchema.extend({ wait: z.coerce.number().int().min(0).max(25).default(0) });
+const channelInboxQuerySchema = channelStatusQuerySchema.extend({ after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional() });
+const channelAckSchema = channelSessionSchema.extend({ cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER) });
 const resultSchema = z.object({
   lease_token: z.string().min(1).max(256),
   result: z.unknown().optional(),
@@ -44,7 +50,8 @@ export async function createServer(options: ServerOptions) {
   const requestTtlMs = options.requestTtlMs ?? 60_000;
   const offlineMs = options.offlineMs ?? 60_000;
   const leaseMs = options.leaseMs ?? 30_000;
-  for (const [name, value] of Object.entries({ maxUploadBytes, quotaBytes, requestTtlMs, offlineMs, leaseMs })) {
+  const channelLeaseMs = options.channelLeaseMs ?? 90_000;
+  for (const [name, value] of Object.entries({ maxUploadBytes, quotaBytes, requestTtlMs, offlineMs, leaseMs, channelLeaseMs })) {
     if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
   }
   const filesDir = join(options.dataDir, 'files');
@@ -129,7 +136,67 @@ export async function createServer(options: ServerOptions) {
     return row;
   }
 
-  async function poll<T>(request: FastifyRequest, reply: FastifyReply, seconds: number, read: () => T, ready: (value: T) => boolean): Promise<T> {
+  function transaction<T>(work: () => T): T {
+    // Serialize round selection and membership changes even if another relay process opens this database.
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = work();
+      db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  function channelParam(request: FastifyRequest) {
+    return z.object({ channel: channelIdSchema }).parse(request.params).channel;
+  }
+  function channelRound(channel: string, generation?: string): Row {
+    const row = db.prepare('SELECT r.*, p.pairing_id FROM channel_heads h JOIN channel_rounds r ON r.generation = h.generation JOIN channel_pairings p ON p.generation = r.generation WHERE h.channel = ?').get(channel) as Row | undefined;
+    if (!row) throw new BridgeError(404, 'channel_not_found', 'Join this channel before using it');
+    if (generation !== undefined && generation !== row.generation) throw new BridgeError(409, 'stale_generation', 'This channel round has ended; join again');
+    return row;
+  }
+  function resetChannelPairing(round: Row) {
+    round.pairing_id = randomUUID();
+    db.prepare('UPDATE channel_pairings SET pairing_id = ? WHERE generation = ?').run(round.pairing_id, round.generation);
+    db.prepare('UPDATE channel_members SET confirmed_peer_session = NULL WHERE generation = ?').run(round.generation);
+  }
+  function expireChannelMembers(round: Row, now: number) {
+    const result = db.prepare(`UPDATE channel_members SET lease_until = 0, confirmed_peer_session = NULL
+      WHERE generation = ? AND lease_until > 0 AND (lease_until <= ? OR device_name IN (SELECT name FROM devices WHERE revoked = 1))`).run(round.generation, now);
+    if (result.changes) {
+      // A surviving participant must acknowledge the next pairing, including a peer rejoining with the same session ID.
+      resetChannelPairing(round);
+      signal();
+    }
+  }
+  function liveChannelMembers(generation: string, now: number): Row[] {
+    return db.prepare(`SELECT m.* FROM channel_members m JOIN devices d ON d.name = m.device_name
+      WHERE m.generation = ? AND m.lease_until > ? AND d.revoked = 0 ORDER BY m.session_id`).all(generation, now) as Row[];
+  }
+  function channelMember(round: Row, session: string, who: Actor, now: number, renew = true): Row {
+    const row = db.prepare('SELECT * FROM channel_members WHERE generation = ? AND session_id = ?').get(round.generation, session) as Row | undefined;
+    if (!row || row.device_name !== who.name) throw new BridgeError(403, 'channel_session_mismatch', 'This session does not belong to the authenticated device');
+    if (row.lease_until <= now) throw new BridgeError(409, 'channel_session_expired', 'This channel session has expired; join again');
+    if (renew) {
+      row.lease_until = now + channelLeaseMs;
+      db.prepare('UPDATE channel_members SET lease_until = ? WHERE generation = ? AND session_id = ?').run(row.lease_until, round.generation, session);
+    }
+    return row;
+  }
+  function channelStatus(round: Row, member: Row, now: number): ChannelStatus {
+    const peer = liveChannelMembers(round.generation, now).find(row => row.session_id !== member.session_id);
+    const connected = !!peer && member.confirmed_peer_session === peer.session_id && peer.confirmed_peer_session === member.session_id;
+    return {
+      channel: round.channel, generation: round.generation, pairing_id: round.pairing_id, session_id: member.session_id,
+      secret_word: round.secret_word, status: connected ? 'connected' : 'waiting',
+      peer: peer ? { device: peer.device_name, session_id: peer.session_id } : null,
+      lease_expires_at: new Date(member.lease_until).toISOString(),
+    };
+  }
+
+  async function poll<T>(request: FastifyRequest, reply: FastifyReply, seconds: number, read: () => T, ready: (value: T) => boolean, intervalMs = 250): Promise<T> {
     const deadline = Date.now() + seconds * 1000;
     const who = actor(request);
     while (true) {
@@ -144,7 +211,7 @@ export async function createServer(options: ServerOptions) {
           reply.raw.off('close', finish);
           resolve();
         };
-        const timer = setTimeout(finish, Math.min(250, deadline - Date.now()));
+        const timer = setTimeout(finish, Math.min(intervalMs, deadline - Date.now()));
         bus.once('change', finish);
         reply.raw.once('close', finish);
       });
@@ -183,6 +250,10 @@ export async function createServer(options: ServerOptions) {
     const { name } = z.object({ name: nameSchema }).parse(request.params);
     if (!db.prepare('SELECT name FROM devices WHERE name = ?').get(name)) throw new BridgeError(404, 'device_not_found', 'Device does not exist');
     db.prepare('UPDATE devices SET revoked = 1 WHERE name = ?').run(name);
+    const affected = db.prepare(`SELECT DISTINCT r.*, p.pairing_id FROM channel_members m JOIN channel_rounds r ON r.generation = m.generation
+      JOIN channel_pairings p ON p.generation = r.generation WHERE m.device_name = ? AND m.lease_until > ?`).all(name, Date.now()) as Row[];
+    for (const round of affected) resetChannelPairing(round);
+    db.prepare('UPDATE channel_members SET lease_until = 0 WHERE device_name = ?').run(name);
     db.prepare("UPDATE requests SET status = 'failed', lease_token = NULL, lease_until = NULL, error_json = ? WHERE (from_name = ? OR to_name = ?) AND status IN ('pending', 'running')")
       .run(JSON.stringify({ code: 'device_revoked', message: 'A device associated with this request was revoked' }), name, name);
     signal();
@@ -197,6 +268,165 @@ export async function createServer(options: ServerOptions) {
   app.get('/v1/devices', { preHandler: requireDevice }, async () => ({
     devices: (db.prepare('SELECT * FROM devices ORDER BY name').all() as Row[]).map(row => deviceInfo(row, offlineMs)),
   }));
+
+  app.post('/v1/channels/:channel/join', { preHandler: requireDevice }, async request => {
+    const channel = channelParam(request);
+    const input = channelJoinSchema.parse(request.body);
+    const who = actor(request);
+    const result = transaction(() => {
+      const now = Date.now();
+      let round = db.prepare('SELECT r.*, p.pairing_id FROM channel_heads h JOIN channel_rounds r ON r.generation = h.generation JOIN channel_pairings p ON p.generation = r.generation WHERE h.channel = ?').get(channel) as Row | undefined;
+      if (round) expireChannelMembers(round, now);
+      let members = round ? liveChannelMembers(round.generation, now) : [];
+      if (!members.length) {
+        round = { channel, generation: randomUUID(), pairing_id: randomUUID(), secret_word: input.secret_word, created_at: now };
+        db.prepare('INSERT INTO channel_rounds (generation, channel, secret_word, created_at) VALUES (?, ?, ?, ?)')
+          .run(round.generation, channel, round.secret_word, now);
+        db.prepare('INSERT INTO channel_pairings (generation, pairing_id) VALUES (?, ?)').run(round.generation, round.pairing_id);
+        db.prepare('INSERT INTO channel_heads (channel, generation) VALUES (?, ?) ON CONFLICT (channel) DO UPDATE SET generation = excluded.generation')
+          .run(channel, round.generation);
+        members = [];
+      }
+      const current = round!;
+      const prior = db.prepare('SELECT * FROM channel_members WHERE generation = ? AND session_id = ?').get(current.generation, input.session_id) as Row | undefined;
+      if (prior && prior.device_name !== who.name) throw new BridgeError(403, 'channel_session_mismatch', 'This session belongs to another device');
+      const sameDevice = members.find(row => row.device_name === who.name);
+      if (sameDevice && sameDevice.session_id !== input.session_id) throw new BridgeError(409, 'device_already_joined', 'This device already has an active session in the channel');
+      if (!sameDevice) {
+        if (members.length >= 2) throw new BridgeError(409, 'channel_full', 'This channel already has two active devices');
+        resetChannelPairing(current);
+        db.prepare(`INSERT INTO channel_members (generation, session_id, device_name, lease_until) VALUES (?, ?, ?, ?)
+          ON CONFLICT (generation, session_id) DO UPDATE SET lease_until = excluded.lease_until, confirmed_peer_session = NULL`)
+          .run(current.generation, input.session_id, who.name, now + channelLeaseMs);
+      }
+      return channelStatus(current, channelMember(current, input.session_id, who, now), now);
+    });
+    signal();
+    return result;
+  });
+  app.get('/v1/channels/:channel', { preHandler: requireDevice }, async (request, reply) => {
+    const channel = channelParam(request);
+    const input = channelStatusQuerySchema.parse(request.query);
+    const who = actor(request);
+    let initialPeer: string | null | undefined;
+    let initialPairing: string | undefined;
+    let needsConfirmation = false;
+    return poll(request, reply, input.wait, () => transaction(() => {
+      const now = Date.now();
+      const round = channelRound(channel, input.generation);
+      expireChannelMembers(round, now);
+      const member = channelMember(round, input.session_id, who, now);
+      const status = channelStatus(round, member, now);
+      needsConfirmation = status.peer !== null && member.confirmed_peer_session !== status.peer.session_id;
+      return status;
+    }), value => {
+      const peer = value.peer?.session_id ?? null;
+      if (initialPeer === undefined) initialPeer = peer;
+      if (initialPairing === undefined) initialPairing = value.pairing_id;
+      return value.status === 'connected' || needsConfirmation || peer !== initialPeer || value.pairing_id !== initialPairing;
+    }, Math.max(1, Math.min(250, Math.floor(channelLeaseMs / 3))));
+  });
+  app.post('/v1/channels/:channel/confirm', { preHandler: requireDevice }, async request => {
+    const channel = channelParam(request);
+    const input = channelConfirmSchema.parse(request.body);
+    const who = actor(request);
+    const result = transaction(() => {
+      const now = Date.now();
+      const round = channelRound(channel, input.generation);
+      expireChannelMembers(round, now);
+      const member = channelMember(round, input.session_id, who, now);
+      if (input.pairing_id !== round.pairing_id) throw new BridgeError(409, 'channel_pairing_changed', 'The channel pairing changed; fetch its current status before confirming');
+      if (input.secret_word !== round.secret_word) throw new BridgeError(409, 'secret_mismatch', 'The secret word does not match this channel round');
+      const peer = liveChannelMembers(round.generation, now).find(row => row.session_id !== member.session_id);
+      member.confirmed_peer_session = peer?.session_id ?? null;
+      db.prepare('UPDATE channel_members SET confirmed_peer_session = ? WHERE generation = ? AND session_id = ?')
+        .run(member.confirmed_peer_session, round.generation, member.session_id);
+      return channelStatus(round, member, now);
+    });
+    signal();
+    return result;
+  });
+  app.delete('/v1/channels/:channel/sessions/:session_id', { preHandler: requireDevice }, async (request, reply) => {
+    const { channel, session_id } = z.object({ channel: channelIdSchema, session_id: z.string().uuid() }).parse(request.params);
+    const { generation, pairing_id } = z.object({ generation: z.string().uuid(), pairing_id: z.string().uuid() }).strict().parse(request.query);
+    const who = actor(request);
+    transaction(() => {
+      const round = channelRound(channel, generation);
+      const member = db.prepare('SELECT * FROM channel_members WHERE generation = ? AND session_id = ?').get(round.generation, session_id) as Row | undefined;
+      if (!member || member.device_name !== who.name) throw new BridgeError(403, 'channel_session_mismatch', 'This session does not belong to the authenticated device');
+      if (member.lease_until > Date.now()) {
+        if (pairing_id !== round.pairing_id) throw new BridgeError(409, 'channel_pairing_changed', 'The channel pairing changed; fetch its current status before leaving');
+        resetChannelPairing(round);
+      }
+      db.prepare('UPDATE channel_members SET lease_until = 0 WHERE generation = ? AND session_id = ?').run(generation, session_id);
+    });
+    signal();
+    return reply.code(204).send();
+  });
+  app.post('/v1/channels/:channel/messages', { preHandler: requireDevice }, async request => {
+    const channel = channelParam(request);
+    const input = channelMessageInputSchema.parse(request.body);
+    const who = actor(request);
+    const key = idem(request);
+    const payloadHash = hash(JSON.stringify(input));
+    const message = transaction(() => {
+      const now = Date.now();
+      const round = channelRound(channel, input.generation);
+      expireChannelMembers(round, now);
+      const member = channelMember(round, input.session_id, who, now);
+      if (key) {
+        const prior = db.prepare('SELECT * FROM channel_messages WHERE generation = ? AND from_session = ? AND idem_key = ?').get(input.generation, input.session_id, key) as Row | undefined;
+        if (prior) {
+          if (prior.payload_hash !== payloadHash) throw new BridgeError(409, 'idempotency_conflict', 'This idempotency key was already used for different content');
+          return channelMessageInfo(prior);
+        }
+      }
+      const status = channelStatus(round, member, now);
+      if (status.status !== 'connected' || !status.peer) throw new BridgeError(409, 'channel_not_connected', 'Both devices must confirm the current pairing before sending');
+      for (const id of input.file_ids) getFile(id);
+      const id = randomUUID();
+      db.prepare(`INSERT INTO channel_messages (id, channel, generation, from_name, from_session, to_name, to_session, text, file_ids, created_at, idem_key, payload_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(id, channel, input.generation, who.name, input.session_id, status.peer.device, status.peer.session_id, input.text, JSON.stringify(input.file_ids), now, key, payloadHash);
+      return channelMessageInfo(db.prepare('SELECT * FROM channel_messages WHERE id = ?').get(id) as Row);
+    });
+    signal();
+    return { message };
+  });
+  app.get('/v1/channels/:channel/messages', { preHandler: requireDevice }, async (request, reply) => {
+    const channel = channelParam(request);
+    const input = channelInboxQuerySchema.parse(request.query);
+    const who = actor(request);
+    return poll(request, reply, input.wait, () => transaction(() => {
+      const now = Date.now();
+      const round = channelRound(channel, input.generation);
+      expireChannelMembers(round, now);
+      const member = channelMember(round, input.session_id, who, now);
+      const after = input.after ?? member.acknowledged_cursor;
+      const rows = db.prepare('SELECT * FROM channel_messages WHERE generation = ? AND to_name = ? AND to_session = ? AND seq > ? ORDER BY seq LIMIT 100')
+        .all(input.generation, who.name, input.session_id, after) as Row[];
+      return { messages: rows.map(channelMessageInfo), cursor: rows.at(-1)?.seq ?? after, acknowledged_cursor: member.acknowledged_cursor };
+    }), value => value.messages.length > 0, Math.max(1, Math.min(250, Math.floor(channelLeaseMs / 3))));
+  });
+  app.post('/v1/channels/:channel/ack', { preHandler: requireDevice }, async request => {
+    const channel = channelParam(request);
+    const input = channelAckSchema.parse(request.body);
+    const who = actor(request);
+    return transaction(() => {
+      const now = Date.now();
+      const round = channelRound(channel, input.generation);
+      expireChannelMembers(round, now);
+      const member = channelMember(round, input.session_id, who, now);
+      if (input.cursor !== 0 && !db.prepare('SELECT seq FROM channel_messages WHERE generation = ? AND to_name = ? AND to_session = ? AND seq = ?')
+        .get(input.generation, who.name, input.session_id, input.cursor)) {
+        throw new BridgeError(400, 'invalid_cursor', 'Acknowledge a cursor from this session mailbox');
+      }
+      const acknowledged_cursor = Math.max(member.acknowledged_cursor, input.cursor);
+      db.prepare('UPDATE channel_members SET acknowledged_cursor = ? WHERE generation = ? AND session_id = ?')
+        .run(acknowledged_cursor, input.generation, input.session_id);
+      return { acknowledged_cursor };
+    });
+  });
 
   app.post('/v1/messages', { preHandler: requireDevice }, async request => {
     const input = messageInputSchema.parse(request.body);

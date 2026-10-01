@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
-import type { Device, FileInfo, Message, RemoteRequest } from '../shared/protocol.js';
+import { randomUUID } from 'node:crypto';
+import type { ChannelMessage, Device, FileInfo, Message, RemoteRequest } from '../shared/protocol.js';
 
 export type Row = Record<string, any>;
 
@@ -36,7 +37,47 @@ export function openDatabase(path: string): DatabaseSync {
       sha256 TEXT NOT NULL, content_type TEXT NOT NULL,
       uploaded_by TEXT NOT NULL, created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS channel_rounds (
+      generation TEXT PRIMARY KEY, channel TEXT NOT NULL,
+      secret_word TEXT NOT NULL, created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS channel_heads (
+      channel TEXT PRIMARY KEY, generation TEXT NOT NULL UNIQUE REFERENCES channel_rounds(generation)
+    );
+    CREATE TABLE IF NOT EXISTS channel_pairings (
+      generation TEXT PRIMARY KEY REFERENCES channel_rounds(generation), pairing_id TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS channel_members (
+      generation TEXT NOT NULL REFERENCES channel_rounds(generation), session_id TEXT NOT NULL,
+      device_name TEXT NOT NULL REFERENCES devices(name), lease_until INTEGER NOT NULL,
+      confirmed_peer_session TEXT, acknowledged_cursor INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (generation, session_id)
+    );
+    CREATE INDEX IF NOT EXISTS channel_members_available ON channel_members (generation, lease_until);
+    CREATE TABLE IF NOT EXISTS channel_messages (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+      channel TEXT NOT NULL, generation TEXT NOT NULL REFERENCES channel_rounds(generation),
+      from_name TEXT NOT NULL, from_session TEXT NOT NULL,
+      to_name TEXT NOT NULL, to_session TEXT NOT NULL,
+      text TEXT NOT NULL, file_ids TEXT NOT NULL, created_at INTEGER NOT NULL,
+      idem_key TEXT, payload_hash TEXT,
+      UNIQUE (generation, from_session, idem_key)
+    );
+    CREATE INDEX IF NOT EXISTS channel_messages_recipient ON channel_messages (generation, to_session, seq);
   `);
+  // Add pairing fencing to an existing channel database without rewriting rounds, sessions or mailbox data.
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const row of db.prepare('SELECT generation FROM channel_rounds WHERE generation NOT IN (SELECT generation FROM channel_pairings)').all() as Row[]) {
+      db.prepare('INSERT INTO channel_pairings (generation, pairing_id) VALUES (?, ?)').run(row.generation, randomUUID());
+      db.prepare('UPDATE channel_members SET confirmed_peer_session = NULL WHERE generation = ?').run(row.generation);
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    db.close();
+    throw error;
+  }
   return db;
 }
 
@@ -52,6 +93,16 @@ export function deviceInfo(row: Row, offlineMs: number): Device {
 export function messageInfo(row: Row): Message {
   return {
     id: row.id, seq: row.seq, from: row.from_name, to: row.to_name,
+    text: row.text, file_ids: JSON.parse(row.file_ids),
+    created_at: new Date(row.created_at).toISOString(),
+  };
+}
+
+export function channelMessageInfo(row: Row): ChannelMessage {
+  return {
+    id: row.id, seq: row.seq, channel: row.channel, generation: row.generation,
+    from: row.from_name, from_session: row.from_session,
+    to: row.to_name, to_session: row.to_session,
     text: row.text, file_ids: JSON.parse(row.file_ids),
     created_at: new Date(row.created_at).toISOString(),
   };
