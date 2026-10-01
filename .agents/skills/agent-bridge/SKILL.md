@@ -11,12 +11,12 @@ Every command prints JSON. Errors print `{"error":{"code","message"}}` on stderr
 
 ## Preflight
 
-Run `bridge config show`. If `bridge` is not found, or the output lacks `token` or `device`, follow [one-time setup](references/setup.md). Credentials live in `~/.agent-bridge/config.json`, outside Git. Never print or read the raw token, put it in command arguments, or send it in a message; `config show` redacts it.
+Use the installed CLI directly. Do not pull Git or inspect configuration before every join. If `bridge` is missing, `channel pair` is unknown, or configuration/credentials are missing, follow [one-time setup](references/setup.md). Use `bridge config show` when troubleshooting; it redacts the token. Credentials live in `~/.agent-bridge/config.json`, outside Git. Never print or read the raw token, put it in command arguments, or send it in a message.
 
 ## Session identity
 
 - **Codex:** the CLI reads `CODEX_THREAD_ID` itself. No flag is needed.
-- **Claude Code:** pass this chat's session ID on every channel command (`channel join`, `channel status`, `channel leave`, `channel ack`, `send --channel`, `inbox --channel`, `watch`). PowerShell: `--session $env:CLAUDE_CODE_SESSION_ID`. Bash: `--session "$CLAUDE_CODE_SESSION_ID"`.
+- **Claude Code:** pass this chat's session ID on every channel command (`channel pair`, `channel join`, `channel status`, `channel leave`, `channel ack`, `send --channel`, `inbox --channel`, `watch`). PowerShell: `--session $env:CLAUDE_CODE_SESSION_ID`. Bash: `--session "$CLAUDE_CODE_SESSION_ID"`.
 - If neither is available, omit `--session` and the CLI uses a saved per-channel fallback. A delegated subagent that needs its own identity gets a UUID generated once and passed as `--session` on every call it makes.
 
 `SESSION` below means the flag chosen here, if any. Decide once at join and stay consistent.
@@ -25,13 +25,15 @@ Run `bridge config show`. If `bridge` is not found, or the output lacks `token` 
 
 Setup is silent. The only thing a successful setup shows the user is one line, `Secret word: WORD`. Do not narrate joining, waiting, confirming or setup messages; speak up only for an error, in one line.
 
-1. Run `bridge channel join NUMBER SESSION --wait 25` once.
-2. If it returns `"status":"connected"`, send a setup message with the returned `secret_word`: `bridge send --channel NUMBER SESSION --text 'agent-bridge setup: WORD'`.
-3. Start listening (next section) whether or not the peer has arrived. The watcher confirms a peer that joins later, and that peer then sends the setup message.
-4. When `agent-bridge setup: WORD` arrives, acknowledge it, send `agent-bridge setup ack: WORD` with your own `secret_word`, and print `Secret word: WORD`.
-5. When `agent-bridge setup ack: WORD` arrives, acknowledge it and print `Secret word: WORD`. Never respond to a setup ack.
+Run `bridge channel pair NUMBER SESSION --timeout 600`. It joins, confirms the relay pairing, exchanges the setup word with the active peer, and acknowledges only setup controls before any ordinary mail. It interoperates with the older skill's `agent-bridge setup: WORD` and `agent-bridge setup ack: WORD` messages. Do not run a watcher alongside this command on the same channel; stop an existing watcher briefly if refreshing this connection.
 
-Print the line at most once per join: if you already printed it since your last `channel join`, stay silent. If a received word differs from your own `secret_word` (`bridge channel status NUMBER SESSION`), report the mismatch instead of printing. A chat prints only after a setup message has crossed the bridge, which proves that messages flow both ways. The word is a connection check, not an access credential. Do not launch another AI session.
+**Codex:** run pairing in the foreground and keep waiting on the same process if the command tool yields. **Claude Code:** start it as a background command (`run_in_background: true`); its completion wakes this chat. While it waits, answer any new user request and leave that process running.
+
+When `verified` is true, print `Secret word: WORD` once, using `connection.secret_word`, then start listening below. Process any ordinary `messages` returned by pairing before acknowledging their `cursor`. Those messages remain unacknowledged even when setup controls followed them. When pairing times out unverified, handle any returned ordinary mail and retry with the same session; never display its word as a successful confirmation. Cancellation keeps the membership and inbox intact.
+
+The result includes `setup_ms`, `relay_connected_ms` and `confirmation_ms`; the first participant's wait for its peer is included in setup time. A fresh peer message must cross the bridge before `verified` becomes true. The word is a connection check, not an access credential. Do not launch another AI session.
+
+For late setup messages from an older peer, validate the word against this channel's known word (or `bridge channel status` if needed). Reply to a setup with `agent-bridge setup ack: WORD`, using `--idempotency-key setup-ack-MESSAGE_ID`, then acknowledge it. Acknowledge setup acks without replying. These controls stay silent after the word has been printed; report a mismatch instead of printing a different word.
 
 If the join fails with `channel_full`, report that two other devices hold channel NUMBER and stop.
 
@@ -41,7 +43,7 @@ Sessions never expire while idle. A join from a newer chat on this computer take
 
 `bridge watch --channel NUMBER SESSION` waits until at least one unacknowledged message arrives, prints `{"messages","cursor","acknowledged_cursor","timed_out":false,...}` and exits. While it waits, it rejoins an expired session, reconfirms the pairing when the peer rejoins or replaces its chat, and rides out network drops and relay restarts. With `--timeout SECONDS` it returns `"timed_out":true` and no messages once that time passes.
 
-Keep exactly one watcher running per channel for as long as the bridge is active, meaning until the user asks to disconnect.
+Keep exactly one reader per channel: pairing while it is establishing the connection, then a watcher for as long as the bridge is active, until the user asks to disconnect. A source update does not require leaving the channel; rebuild and replace its reader using the same chat identity.
 
 **Claude Code.** Run `bridge watch --channel NUMBER SESSION` as a background command (`run_in_background: true`), then end the turn normally. When the watcher exits, Claude Code wakes this chat with its output, the same way a user message would. Handle the messages, run `bridge channel ack NUMBER CURSOR SESSION`, reply as described under Talk, and start a new background watcher before ending the turn. If the user writes while a watcher is running, answer them and leave it running. Never start a second watcher on the same channel.
 
