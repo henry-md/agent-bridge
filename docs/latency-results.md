@@ -35,3 +35,29 @@ Both agents in the final trial displayed the same verified word and remained in 
 These are single pairs per setting, with differing agent launch spacing and ordinary model scheduling. The final second agent was created 7.16 seconds after the first, versus 13.36 seconds initially. Measured from creation of the second agent until both were complete, the final trial took 13.98 seconds versus 13.84 seconds initially. Thus the first-agent wall-time improvement includes less waiting for its peer; it does not prove a faster relay or a lower population latency. About nine seconds still elapsed inside each fresh agent before launching the CLI. The reliable architectural change is that receiving now starts immediately after verification, without another model/tool turn.
 
 The client change is `ff86187`; the shorter skill and polling instructions are `902af40` (mirrored as `803bce2` in codex-skills). The 67-test suite passes on Windows and macOS, with one Windows-only test skipped on macOS. New coverage checks immediate pair output, same-process receiving, preservation of queued ordinary mail, scoped setup-ack draining, attachment/mixed-page preservation, configuration changes and bounded stalled acknowledgments. The two temporary credentials were revoked after all test sessions left. Channel 1 kept its original generation and pairing throughout.
+
+## Resident runtime and pre-model confirmation
+
+The 21-second fresh-agent result was model/tool orchestration, not a transport floor. A resident client now owns one inbox reader per channel and automatically echoes fresh UUID probes through the same durable message mailbox. Proofs bind the current generation, pairing, two sessions and word; cached words never count as fresh success. Setup acknowledgments run after idle time in a coalesced background queue, so they cannot delay rearming the inbox. Ordinary mail and attachments remain unacknowledged until the agent processes them.
+
+| Boundary | Median | 95th percentile | Samples |
+|---|---:|---:|---:|
+| Warm local authenticated RPC | 0.50 ms | 1.05 ms | 20 |
+| Fresh nonce proof: two processes, local relay | 2.42 ms | 3.49 ms | 20 |
+| Fresh nonce proof: Mac → Railway Virginia → Windows → Railway → Mac | 200.97 ms | 342.59 ms | 20 |
+
+The cross-machine run had zero failures. A separate 20-sample repeat measured 201.99 ms median / 500.22 ms p95 / zero failures. These warm metrics exclude Node boot, model scheduling, tool scheduling and UI paint. Warmups are excluded; deadlines and failed outcomes remain explicit in the reproducible benchmark. A Mac-to-Mac-process Railway baseline before deferred receipts measured 506.13 ms median / 1160.73 ms p95; it is a different route and should not be treated as a controlled Windows before/after comparison.
+
+The deployed volume is the next dominant constraint. Isolated temporary SQLite databases used WAL + synchronous FULL without touching production data. Twenty tiny transactions on /data measured commit-only 279.32 ms median / 832.15 ms p95 / 1797.77 ms maximum; the same test on container /tmp measured 0.86 ms median. An independent append-and-fsync probe on /data ranged from 21.14 to 615.76 ms. BEGIN and INSERT themselves were usually below 0.2 ms. Probe files were removed and the temporary Railway SSH key was revoked. Production still uses FULL durability and the persistent volume; /tmp is only a diagnostic comparison. A fresh proof requires durable probe and echo writes, plus network travel, so a 10 ms cross-machine promise would contradict these measurements.
+
+Two new Codex agents used prewarmed runtimes on a dedicated Railway channel. Agent A displayed the matching word in 17.309 seconds from creation and began its next foreground wait at 17.877 seconds; B displayed it in 11.458 seconds and waited at 11.989 seconds. Creation was staggered by 6.583 seconds. Both CLI processes already returned watching:true; their fresh proofs took 165.72 / 177.05 ms. Both agents were waiting by 18.572 seconds after A was created, or 11.989 seconds after B was created. They acknowledged stop messages through the bridge and left only their test channel. This is still a cold-model result, not a sub-second visible agent reply.
+
+The optional Codex UserPromptSubmit adapter moves connection work before model generation and injects verified context; SessionStart warms the daemon. A read-only SSE pane displays the same verified word independently of the model. Direct adapter execution and real browser rendering were tested. Native hook activation requires the human's Codex trust review; the integration was installed but had not been trusted during the fresh-agent test. No claim of a fully timed native Desktop hook/UI run is made. Claude Code uses the daemon CLI and pane; the native hook installer targets Codex. Windows cold daemon startup took 6.112 seconds; it is amortized between sessions, not hidden from cold-start results.
+
+Reproduce on already paired resident clients:
+
+```sh
+node scripts/benchmark-runtime.mjs --channel 4040 --samples 20 --output runtime-latency.json
+```
+
+The metric covers a fresh local RPC call until its nonce returns through the peer runtime. It prints p50/p95, all attempts and failures, and never prints credentials. File transfer continues through separate authenticated streamed HTTP requests with checksum verification. macOS and Windows CI cover runtime proofs, durable paging/restart, revocation, folder boundaries, interrupted transfers and the existing upload/download suite. These are client-only changes; Railway correctly skipped server deployment, preserving its active URL and SQLite volume.
