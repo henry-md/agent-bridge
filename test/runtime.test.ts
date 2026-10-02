@@ -204,3 +204,18 @@ test('slow control receipts do not delay the next fresh proof or the sole inbox 
   const proof = await a.client.pair('4040', a.session, 250);
   assert.equal(proof.verified, true); assert.ok(proof.proof_round_trip_ms! < 250);
 });
+
+test('pre-model adapter supplies only fresh verified context and leaves ordinary mail for the agent', { timeout: 20_000 }, async t => {
+  const h = await fixture(t), a = await h.device('laptop'), b = await h.device('vm');
+  const [paired] = await Promise.all([a.client.pair('4040', a.session, 5000), b.client.pair('4040', b.session, 5000)]);
+  const message = await b.relay.sendChannel('4040', { session_id: b.session, generation: paired.connection!.generation, text: 'private ordinary context', file_ids: [] });
+  const child = spawn(process.execPath, ['.agents/skills/agent-bridge/scripts/prompt-hook.mjs'], { env: { ...process.env, BRIDGE_CONFIG: a.config }, stdio: ['pipe', 'pipe', 'pipe'] });
+  let stdout = '', stderr = ''; child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; });
+  child.stdin.end(JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: a.session, prompt: '/agent-bridge 4040' }));
+  assert.equal((await once(child, 'exit'))[0], 0); assert.equal(stderr, '');
+  const output = JSON.parse(stdout); assert.equal(output.continue, true); assert.equal(output.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
+  assert.ok(output.systemMessage.includes(paired.connection!.secret_word)); assert.ok(output.hookSpecificOutput.additionalContext.includes('watch --daemon'));
+  assert.ok(!stdout.includes(message.text)); assert.ok(!stdout.includes(a.info.token));
+  const page = await a.client.watch('4040', a.session, 1000); assert.equal(page.messages[0].id, message.id);
+  assert.ok((await a.relay.channelInbox('4040', a.session, paired.connection!.generation, undefined, 0)).messages.some(record => record.id === message.id));
+});

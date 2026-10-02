@@ -33,3 +33,5 @@ Sign-in is the user's step: they run `railway login` themselves (or `railway log
 Without Railway access, have the user put a separately issued device token in an environment variable in their own terminal. Never ask for it in chat. Then run `bridge config set --url URL --device NAME --token-env BRIDGE_TOKEN` and remove the variable. Do not replace a working device token just to join a channel.
 
 After registration, `/agent-bridge 4040` pairs active agents. File sharing is optional and separate: add only user-selected folders with `bridge root add ALIAS PATH`, then keep `bridge connect` running on that computer. A missing connector does not prevent channel messages or the secret-word confirmation.
+
+Start the resident runtime once with `bridge daemon start`. Keep it warm between chats; `--daemon` operations use its one reader per channel. Native pre-model acceleration is optional; see [runtime setup](runtime.md).
