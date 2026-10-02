@@ -10,6 +10,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import test, { type TestContext } from 'node:test';
 import { RelayClient } from '../src/client/relay.js';
+import { watchChannel } from '../src/client/channel.js';
+import type { BridgeConfig } from '../src/client/config.js';
+import type { ChannelStatus } from '../src/shared/protocol.js';
 import { createServer } from '../src/server/server.js';
 
 const run = promisify(execFile);
@@ -72,6 +75,37 @@ test('single-command pairing exchanges the word for simultaneous and staggered C
     assert.equal(results[0].connection.secret_word, results[1].connection.secret_word);
     assert.equal(results[0].connection.peer.session_id, bSession); assert.equal(results[1].connection.peer.session_id, aSession);
   }
+});
+
+test('pair-and-watch prints the verified word immediately, drains late setup acks and preserves ordinary mail', { timeout: 30_000 }, async t => {
+  const h = await harness(t); const a = await h.device('laptop'); const b = await h.device('vm');
+  const aSession = randomUUID(); const bSession = randomUUID();
+  const running = run(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'channel', 'pair', '4040', '--watch', '--watch-timeout', '5'], { cwd: process.cwd(), env: { ...process.env, CODEX_THREAD_ID: aSession, BRIDGE_CONFIG: a }, timeout: 15_000 });
+  void running.catch(() => {}); t.after(() => { running.child.kill(); });
+  const firstLine = new Promise<any>((resolve, reject) => {
+    let buffered = ''; running.child.stdout!.on('data', chunk => { buffered += chunk; const end = buffered.indexOf('\n'); if (end >= 0) resolve(JSON.parse(buffered.slice(0, end))); });
+    running.catch(reject);
+  });
+  const peer = cli(b, ['channel', 'pair', '4040', '--timeout', '5'], bSession);
+  const [first, second] = await Promise.all([firstLine, peer]);
+  assert.equal(first.verified, true); assert.equal(first.watching, true); assert.equal(first.connection.secret_word, second.connection.secret_word);
+  assert.equal(running.child.exitCode, null, 'First setup line arrives while the receive process is alive');
+  await cli(b, ['send', '--channel', '4040', '--text', `agent-bridge setup ack: ${first.connection.secret_word}`], bSession);
+  const ordinary = await cli(b, ['send', '--channel', '4040', '--text', 'first real question'], bSession);
+  const lines = (await running).stdout.trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(lines.length, 2); assert.deepEqual(lines[1].messages.map((message: { id: string }) => message.id), [ordinary.message.id]);
+  assert.equal((await cli(a, ['inbox', '--channel', '4040', '--wait', '0'], aSession)).messages[0].id, ordinary.message.id, 'Receiving does not acknowledge ordinary mail');
+});
+
+test('pair-and-watch exits for buffered ordinary mail or unverified setup without starting a second reader', { timeout: 30_000 }, async t => {
+  const h = await harness(t); const a = await h.device('laptop'); const b = await h.device('vm');
+  const aSession = randomUUID(); const bSession = randomUUID(); await pair(a, b, '4040', aSession, bSession);
+  const ordinary = await cli(b, ['send', '--channel', '4040', '--text', 'queued before refresh'], bSession);
+  const [result] = await Promise.all([cli(a, ['channel', 'pair', '4040', '--watch', '--watch-timeout', '5'], aSession), cli(b, ['channel', 'pair', '4040', '--timeout', '5'], bSession)]);
+  assert.equal(result.verified, true); assert.equal(result.watching, false); assert.equal(result.messages[0].id, ordinary.message.id);
+  assert.equal((await cli(a, ['inbox', '--channel', '4040', '--wait', '0'], aSession)).messages[0].id, ordinary.message.id);
+  const absent = await cli(a, ['channel', 'pair', '5050', '--timeout', '1', '--watch', '--watch-timeout', '5'], randomUUID());
+  assert.equal(absent.verified, false); assert.equal(absent.watching, false); assert.equal(absent.timed_out, true);
 });
 
 test('pairing accepts a legacy setup acknowledgment and preserves queued ordinary mail across timeout', { timeout: 30_000 }, async t => {
@@ -425,4 +459,44 @@ test('skill installs the full folder for the user by default and protects existi
   const claude = await cli(config, ['skill', 'install', '--claude'], '', env);
   assert.equal(claude.installed, join(directory, '.claude/skills/agent-bridge', 'SKILL.md')); assert.equal(claude.scope, 'claude');
   await assert.rejects(cli(config, ['skill', 'install', '--claude', '--user'], '', env), (error: unknown) => (error as { stderr: string }).stderr.includes('mutually exclusive'));
+});
+
+test('paired watch drains only complete matching acknowledgment pages and bounds stalled writes', { timeout: 10_000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-paired-watch-'));
+  const previous = process.env.BRIDGE_CONFIG;
+  t.after(async () => { if (previous === undefined) delete process.env.BRIDGE_CONFIG; else process.env.BRIDGE_CONFIG = previous; await rm(directory, { recursive: true, force: true }); });
+  const session = randomUUID(), generation = randomUUID(), peer = randomUUID();
+  const connection: ChannelStatus = { channel: '4040', generation, pairing_id: randomUUID(), session_id: session, secret_word: 'amber-river', status: 'connected', peer: { device: 'vm', session_id: peer }, lease_expires_at: new Date(Date.now() + 90_000).toISOString() };
+  const ack = { id: randomUUID(), seq: 7, channel: '4040', generation, from: 'vm', from_session: peer, to: 'laptop', to_session: session, text: 'agent-bridge setup ack: amber-river', file_ids: [] as string[], created_at: new Date().toISOString() };
+  const ordinary = { ...ack, id: randomUUID(), seq: 8, text: 'ordinary question' };
+  let mode = 'acks', reads = 0, writes = 0;
+  const path = join(directory, 'config.json');
+  let config: BridgeConfig;
+  const url = await httpFixture(t, (req, res) => {
+    if (req.method === 'POST') { writes++; if (mode === 'stall') return; res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ acknowledged_cursor: 7 })); return; }
+    reads++;
+    const messages = reads > 1 ? [ordinary] : mode === 'mixed' ? [ack, ordinary] : [{ ...ack, ...(mode === 'attached' ? { file_ids: [randomUUID()] } : {}), ...(mode === 'wrong-word' ? { text: 'agent-bridge setup ack: wrong-word' } : {}), ...(mode === 'probe' ? { text: 'agent-bridge setup: amber-river' } : {}), ...(mode === 'wrong-peer' ? { from_session: randomUUID() } : {}) }];
+    const snapshot = mode === 'changed-pairing' ? { ...connection, pairing_id: randomUUID() } : connection;
+    const respond = () => res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ messages, cursor: messages.at(-1)!.seq, acknowledged_cursor: reads > 1 ? 7 : 0, connection: snapshot }));
+    if (mode === 'changed-config') { void writeFile(path, JSON.stringify({ ...config, token: 'replacement' })).then(respond); return; }
+    respond();
+  });
+  config = { url, token: 'token', device: 'laptop', roots: {}, channel_sessions: { '4040': { sessions: { [session]: { generation, secret_word: connection.secret_word } } } } };
+  await writeFile(path, JSON.stringify(config)); process.env.BRIDGE_CONFIG = path;
+  const client = new RelayClient(url, config.token!);
+  for (const scenario of ['acks', 'mixed', 'attached', 'wrong-word', 'probe', 'wrong-peer', 'changed-pairing']) {
+    mode = scenario; reads = 0; writes = 0;
+    const page = await watchChannel(client, config, '4040', session, 1, connection);
+    assert.equal(writes, scenario === 'acks' ? 1 : 0, scenario);
+    assert.equal(reads, scenario === 'acks' ? 2 : 1, scenario);
+    assert.equal(page.messages[0].text, scenario === 'acks' ? ordinary.text : scenario === 'wrong-word' ? 'agent-bridge setup ack: wrong-word' : scenario === 'probe' ? 'agent-bridge setup: amber-river' : ack.text, scenario);
+    if (scenario === 'mixed') assert.equal(page.messages[1].id, ordinary.id);
+  }
+  mode = 'stall'; reads = 0; writes = 0;
+  const started = performance.now();
+  const timeout = await watchChannel(client, config, '4040', session, 0.1, connection);
+  assert.equal(timeout.timed_out, true); assert.equal(writes, 1); assert.ok(performance.now() - started < 1000);
+  mode = 'changed-config'; reads = 0; writes = 0;
+  await assert.rejects(watchChannel(client, config, '4040', session, 1, connection), (error: any) => error.code === 'CONFIG_CHANGED');
+  assert.equal(writes, 0, 'A config change stops automatic acknowledgments');
 });

@@ -121,7 +121,7 @@ export function validateChannelTimeout(seconds: number): number {
   if (!Number.isFinite(seconds) || seconds < 0 || seconds > MAX_CHANNEL_TIMEOUT_SECONDS) throw new BridgeError(0, 'INVALID_ARGUMENT', `Timeout must be between 0 and ${MAX_CHANNEL_TIMEOUT_SECONDS} seconds`);
   return seconds;
 }
-export async function watchChannel(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string, timeoutSeconds = 0): Promise<WatchResult> {
+export async function watchChannel(client: RelayClient, config: BridgeConfig, channel: string, sessionId?: string, timeoutSeconds = 0, setup?: ChannelStatus): Promise<WatchResult> {
   validateChannelTimeout(timeoutSeconds);
   let session = requireChannelSession(config, channel, sessionId);
   const deadline = timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : Infinity;
@@ -146,7 +146,24 @@ export async function watchChannel(client: RelayClient, config: BridgeConfig, ch
       }
       // Already authorized mail should reach the agent immediately. The next
       // empty watch (or send) reconfirms a replacement peer without delaying it.
-      if (page.messages.length) return { ...page, channel: session.channel, session_id: session.session_id, timed_out: false };
+      if (page.messages.length) {
+        // A paired process can receive a trailing setup acknowledgment after its
+        // word is verified. Consume only complete pages of those exact controls;
+        // ordinary mail, probes and changed pairings still go to the agent.
+        const connection = page.connection;
+        const setupAcks = setup?.peer && connection?.status === 'connected'
+          && connection.generation === setup.generation && connection.pairing_id === setup.pairing_id && connection.peer?.session_id === setup.peer.session_id
+          && page.messages.every(message => message.channel === channel && message.generation === setup.generation
+            && message.from === setup.peer!.device && message.from_session === setup.peer!.session_id && message.to_session === setup.session_id
+            && message.file_ids.length === 0 && message.text === `agent-bridge setup ack: ${setup.secret_word}`);
+        if (setupAcks) {
+          const current = await readConfig(); sameIdentity(current, config);
+          if (requireChannelSession(current, channel, session.session_id).generation !== setup.generation) throw new BridgeError(0, 'SESSION_CHANGED', 'Channel generation changed before acknowledging setup');
+          const acknowledged = await client.acknowledgeChannel(channel, session.session_id, setup.generation, page.cursor, signal);
+          page.acknowledged_cursor = acknowledged.acknowledged_cursor; failures = 0; continue;
+        }
+        return { ...page, channel: session.channel, session_id: session.session_id, timed_out: false };
+      }
       if (page.connection?.peer && page.connection.status !== 'connected') await confirmStatus(client, page.connection, signal);
       failures = 0;
     } catch (error) {

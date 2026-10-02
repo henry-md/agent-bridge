@@ -65,11 +65,21 @@ for (const operation of ['read', 'list', 'search'] as const) {
   });
 }
 const channels = program.command('channel').description('Pair two chat sessions on a numeric channel');
-channels.command('pair').description('Join and exchange the setup word in one process; ordinary mail remains unacknowledged').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').option('--timeout <seconds>', 'Total setup deadline; 0 waits indefinitely', channelTimeout, 600).action(async (channel, options) => {
+channels.command('pair').description('Join and exchange the setup word in one process; ordinary mail remains unacknowledged').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').option('--timeout <seconds>', 'Total setup deadline; 0 waits indefinitely', channelTimeout, 600).option('--watch', 'Listen in this process after verified setup with no ordinary mail; prints a second JSON line').option('--watch-timeout <seconds>', 'Receive deadline after setup; 0 waits indefinitely', channelTimeout, 600).action(async (channel, options) => {
   const { config, client } = await localClient(); const controller = new AbortController(); const stop = () => controller.abort();
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
-  try { output(await pairChannel(client, config, channel, options.session, options.timeout, controller.signal)); }
-  finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
+  let paired: Awaited<ReturnType<typeof pairChannel>>;
+  try {
+    paired = await pairChannel(client, config, channel, options.session, options.timeout, controller.signal);
+    output({ ...paired, ...(options.watch ? { watching: paired.verified && paired.messages.length === 0 } : {}) });
+  } finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
+  if (options.watch && paired.verified && paired.messages.length === 0) {
+    const current = await readConfig();
+    if (current.url !== config.url || current.token !== config.token || current.device !== config.device) throw new BridgeError(0, 'CONFIG_CHANGED', 'Relay credentials changed after pairing');
+    const session = requireChannelSession(current, channel, paired.session_id);
+    if (session.generation !== paired.connection?.generation) throw new BridgeError(0, 'SESSION_CHANGED', 'Channel generation changed after pairing');
+    output(await watchChannel(client, current, channel, paired.session_id, options.watchTimeout, paired.connection));
+  }
 });
 channels.command('join').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID; defaults to CODEX_THREAD_ID or a saved per-channel UUID').option('--wait <seconds>', 'Wait for the mutual handshake, 0–25 seconds', wait, 25).action(async (channel, options) => {
   const { config, client } = await localClient(); output(channelResult(await joinChannel(client, config, channel, options.session, options.wait)));
