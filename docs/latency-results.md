@@ -61,3 +61,5 @@ node scripts/benchmark-runtime.mjs --channel 4040 --samples 20 --output runtime-
 ```
 
 The metric covers a fresh local RPC call until its nonce returns through the peer runtime. It prints p50/p95, all attempts and failures, and never prints credentials. File transfer continues through separate authenticated streamed HTTP requests with checksum verification. macOS and Windows CI cover runtime proofs, durable paging/restart, revocation, folder boundaries, interrupted transfers and the existing upload/download suite. These are client-only changes; Railway correctly skipped server deployment, preserving its active URL and SQLite volume.
+
+A live 256 KiB synthetic attachment was uploaded from macOS and downloaded on Windows while both resident channels stayed online. The Windows peer reported a 617 ms full CLI download, successful built-in checksum verification, and an independent Get-FileHash match. The scratch download and relay upload were deleted. Temporary benchmark devices were revoked (old tokens returned HTTP 401), helper channels were left, and channel 1 retained the original word, generation and pairing without restarting either AI chat.

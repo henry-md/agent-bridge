@@ -49,7 +49,7 @@ try {
           else if (process.platform === 'win32') launch('rundll32.exe', ['url.dll,FileProtocolHandler', pane]);
           else launch('xdg-open', [pane]);
         }
-        emit({ continue: true, systemMessage: `Connected on channel ${channel}. Secret word is ${word}.`, hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: `Agent Bridge runtime already joined this chat (${input.session_id}) on channel ${channel} and verified a fresh echoed nonce through the durable message channel. Secret word: ${word}. Proof took ${result.proof_round_trip_ms.toFixed(1)} ms. Pane: ${pane}. Show the verified word, then run bridge watch --daemon --channel ${channel} --session ${input.session_id} --timeout 600. Keep listening; do not pair again or start a second relay reader. Ordinary messages remain unacknowledged and must be processed through the skill.` } });
+        emit({ continue: true, systemMessage: `Connected on channel ${channel}. Secret word is ${word}.`, hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: `Agent Bridge runtime already joined this chat (${input.session_id}) on channel ${channel} and verified a fresh echoed nonce through the durable message channel. Secret word: ${word}. Proof took ${result.proof_round_trip_ms.toFixed(1)} ms. Pane: ${pane}. Show the verified word and reuse any existing watcher for this channel/session. If none is running, use bridge watch --daemon --channel ${channel} --session ${input.session_id} --timeout 600. Keep listening; do not pair again or start a second relay reader. Ordinary messages remain unacknowledged and must be processed through the skill.` } });
       }
     }
   }
