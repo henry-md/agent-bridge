@@ -6,7 +6,7 @@ A small authenticated HTTPS relay for agent messages, selected filesystem contex
 Laptop agent -> bridge CLI -> Railway relay <- VM connector -> shared VM folder
 ```
 
-Both clients connect outward. File requests work while the connector is running, even if that computer's AI agent is idle. Agent messages remain in a mailbox until the peer reads them. `bridge watch` lets a chat keep listening: Claude Code runs it in the background and wakes when it exits, and Codex keeps it running inside its turn. The bridge never launches a model or shares chat history automatically.
+Both clients connect outward. File requests work while the connector is running, even if that computer's AI agent is idle. Agent messages remain in a mailbox until the peer reads them. `bridge watch` lets a chat keep listening: Claude Code receives in the foreground during active exchanges and uses one background watcher when idle; Codex keeps listening inside its turn. The bridge never launches a model or shares chat history automatically.
 
 ## Live deployment
 
@@ -52,7 +52,7 @@ Codex thread IDs identify separate sessions; Claude Code passes `--session` with
 
 Inbox reads leave channel messages unacknowledged until `channel ack`; explicit `--after 0` replays the current round. Sessions stay joined while idle until they leave (the lease defaults to ten years; set `CHANNEL_LEASE_MS` to shorten it). A newer chat joining from the same device takes the channel over, and the older chat's calls fail with `channel_session_replaced`. A new peer must acknowledge a fresh handshake; an old word alone cannot prove an active peer. `bridge watch` and `bridge send` confirm a reset pairing automatically. The word is a visual connection check, and bearer tokens still control access. Attachments retain the existing trusted-workspace access model.
 
-`bridge watch --channel N` exits as soon as unacknowledged messages arrive, or with `"timed_out": true` after `--timeout SECONDS`. It rejoins an expired session with the same identity and retries through network failures and relay restarts. Claude Code wakes an idle chat when a background command finishes, so the skill runs the watcher in the background. Codex does not, so the skill keeps a foreground watch loop running inside the turn.
+`bridge watch --channel N` exits as soon as unacknowledged messages arrive, or with `"timed_out": true` after `--timeout SECONDS`. It rejoins an expired session with the same identity and retries through network failures and relay restarts. Claude Code uses foreground receives during an active exchange, then one background watcher after 30 seconds idle; its completion wakes that chat. Codex does not, so the skill keeps a foreground watch loop running inside the turn.
 
 A file connector is needed for remote folder reads, but channel pairing and messages work without it. The skill never launches agents automatically.
 
