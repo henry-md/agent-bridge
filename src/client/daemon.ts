@@ -1,5 +1,5 @@
 import Fastify from 'fastify';
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
 import { z } from 'zod';
 import { BridgeError, channelIdSchema } from '../shared/protocol.js';
@@ -17,12 +17,7 @@ const sessionBody = z.object({ session_id: z.string().uuid(), timeout_ms: z.numb
 export async function runDaemon(onReady?: (info: Omit<DaemonInfo, 'token'>) => void) {
   // Exclusive loopback bind is the owner lock. The OS releases it on crash;
   // there is no stale PID file to reclaim or accidentally steal from a winner.
-  const initial = await readConfig();
-  const port = 20000 + createHash('sha256').update(configPath()).digest().readUInt32BE(0) % 40000;
-  const config = await updateConfig(current => {
-    if (!current || current.url !== initial.url || current.token !== initial.token || current.device !== initial.device) throw new BridgeError(0, 'CONFIG_CHANGED', 'Credentials changed while starting the runtime');
-    return { ...current, runtime: current.runtime ?? { port, channels: {} } };
-  });
+  let config = await readConfig();
   const actor = actorKey(config);
   const token = randomBytes(32).toString('base64url'); const file = daemonInfoPath();
   const app = Fastify({ logger: false, bodyLimit: 64 * 1024 });
@@ -125,7 +120,16 @@ export async function runDaemon(onReady?: (info: Omit<DaemonInfo, 'token'>) => v
   });
   const closed = new Promise<void>(resolve => app.addHook('onClose', async () => { resolve(); }));
   try {
-    url = await app.listen({ host: '127.0.0.1', port: config.runtime!.port }); ownsListener = true;
+    // First startup asks the OS for an available port, avoiding Windows/Hyper-V
+    // excluded ranges. Binding and publishing the port share the config lock:
+    // a concurrent starter then sees the winning port and cannot bind it.
+    config = await updateConfig(async current => {
+      if (!current || actorKey(current) !== actor) throw new BridgeError(0, 'CONFIG_CHANGED', 'Credentials changed while starting the runtime');
+      try { url = await app.listen({ host: '127.0.0.1', port: current.runtime?.port ?? 0 }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EACCES') throw error; url = await app.listen({ host: '127.0.0.1', port: 0 }); }
+      ownsListener = true;
+      return { ...current, runtime: { port: Number(new URL(url).port), channels: current.runtime?.channels ?? {} } };
+    });
     await writePrivateJson(file, { version: 1, url, token, pid: process.pid, actor });
     for (const [channel, session] of Object.entries(config.runtime!.channels)) {
       const runtime = await worker(channel, session, true);

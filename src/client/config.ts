@@ -79,10 +79,10 @@ async function withConfigLock<T>(operation: () => Promise<T>): Promise<T> {
   try { return await operation(); } finally { await retryFileLock(() => rm(lock, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })); }
 }
 export async function writeConfig(config: BridgeConfig): Promise<void> { await withConfigLock(() => saveConfig(config)); }
-export async function updateConfig(update: (current: BridgeConfig | undefined) => BridgeConfig): Promise<BridgeConfig> {
+export async function updateConfig(update: (current: BridgeConfig | undefined) => BridgeConfig | Promise<BridgeConfig>): Promise<BridgeConfig> {
   return withConfigLock(async () => {
     let current: BridgeConfig | undefined;
     try { current = await readConfig(false); } catch (error) { if (!(error instanceof BridgeError) || error.code !== 'CONFIG_REQUIRED') throw error; }
-    const next = update(current); await saveConfig(next); return next;
+    const next = await update(current); await saveConfig(next); return next;
   });
 }

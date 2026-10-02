@@ -36,6 +36,9 @@ export class ChannelRuntime {
   private closeReason = 'RUNTIME_RESTARTING';
   private readonly ready: Promise<void>;
   private readonly work: Promise<void>;
+  private pendingAck?: { generation: string; cursor: number };
+  private ackTimer?: NodeJS.Timeout;
+  private ackWork?: Promise<void>;
   constructor(readonly client: RelayClient, readonly config: BridgeConfig, readonly channel: string, readonly session: string) {
     channelId(channel); z.string().uuid().parse(session); this.changes.setMaxListeners(0);
     this.ready = this.initialize(); this.work = this.loop(); void this.work.catch(() => {});
@@ -113,6 +116,7 @@ export class ChannelRuntime {
       await this.ready;
       while (!this.controller.signal.aborted) {
         try {
+          this.check();
           await this.credentials();
           for (const probe of this.probes.values()) await this.submit(probe);
           const status = this.connection!;
@@ -149,9 +153,7 @@ export class ChannelRuntime {
           // frame itself is already in the durable authenticated mailbox.
           this.changes.emit('change');
           if (prefixCursor > this.acknowledged) {
-            await this.credentials();
-            const ack = await this.client.acknowledgeChannel(this.channel, this.session, snapshot.generation, prefixCursor, this.controller.signal);
-            this.acknowledged = Math.max(this.acknowledged, ack.acknowledged_cursor);
+            this.queueControlAck(snapshot.generation, prefixCursor);
           }
           if (snapshot.peer && snapshot.status !== 'connected') this.update(await this.client.confirmChannel(this.channel, this.session, snapshot.generation, snapshot.secret_word, snapshot.pairing_id, this.controller.signal));
           for (const probe of this.probes.values()) await this.submit(probe);
@@ -178,6 +180,35 @@ export class ChannelRuntime {
       }
     } catch (error) { if (!this.controller.signal.aborted) this.failure = error; }
     finally { this.transport = 'stopped'; this.verifiedAt = undefined; this.changes.emit('change'); }
+  }
+  private queueControlAck(generation: string, cursor: number) {
+    const previous = this.pendingAck;
+    this.pendingAck = { generation, cursor: previous?.generation === generation ? Math.max(previous.cursor, cursor) : cursor };
+    if (this.ackWork || this.controller.signal.aborted) return;
+    if (this.ackTimer) clearTimeout(this.ackTimer);
+    // Setup receipts are coalesced, while probe/echo commits remain durable.
+    // Receipt disk/network latency must never hold the sole inbox reader.
+    this.ackTimer = setTimeout(() => {
+      this.ackTimer = undefined;
+      const target = this.pendingAck; this.pendingAck = undefined;
+      if (!target || this.controller.signal.aborted || this.connection?.generation !== target.generation) return;
+      this.ackWork = (async () => {
+        await this.credentials();
+        if (this.connection?.generation !== target.generation) return;
+        const ack = await this.client.acknowledgeChannel(this.channel, this.session, target.generation, target.cursor, this.controller.signal);
+        await this.credentials();
+        if (this.connection?.generation === target.generation) this.acknowledged = Math.max(this.acknowledged, ack.acknowledged_cursor);
+      })().catch(error => {
+        if (this.controller.signal.aborted) return;
+        if (error instanceof BridgeError && ['stale_generation', 'channel_session_expired'].includes(error.code)) return;
+        if (this.retryable(error)) {
+          if (this.connection?.generation === target.generation) this.pendingAck = { generation: target.generation, cursor: Math.max(target.cursor, this.pendingAck?.generation === target.generation ? this.pendingAck.cursor : 0) };
+        } else { this.failure = error; this.controller.abort(); this.changes.emit('change'); }
+      }).finally(() => {
+        this.ackWork = undefined;
+        if (this.pendingAck) this.queueControlAck(this.pendingAck.generation, this.pendingAck.cursor);
+      });
+    }, 1000);
   }
   private async changed(signal: AbortSignal) {
     if (signal.aborted) return;
@@ -239,5 +270,5 @@ export class ChannelRuntime {
   }
   status() { return { channel: this.channel, session_id: this.session, connection: this.connection, transport: this.transport, verified_at: this.verifiedAt ?? null, pending_messages: this.ordinary.size, proof_round_trip_ms: this.proofMs ?? null }; }
   onChange(listener: () => void) { this.changes.on('change', listener); return () => this.changes.off('change', listener); }
-  async close(reason = 'RUNTIME_RESTARTING') { this.closeReason = reason; this.controller.abort(); this.changes.emit('change'); await this.work; }
+  async close(reason = 'RUNTIME_RESTARTING') { this.closeReason = reason; this.controller.abort(); if (this.ackTimer) clearTimeout(this.ackTimer); this.changes.emit('change'); await this.work; await this.ackWork; }
 }

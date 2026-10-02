@@ -115,6 +115,7 @@ test('resident receiver restores the same pairing after restart, preserves paged
   await b.client.stop(); await b.exited;
   const restored = await daemon(t, b.config);
   assert.equal(restored.info.url, b.info.url); assert.notEqual(restored.info.token, b.info.token);
+  while ((await restored.client.status()).channels[0].pending_messages < 104) await pause(5);
   const page = await b.client.watch('4040', b.session, 5000); // old client follows new private descriptor
   assert.equal(page.messages.length, 100); assert.deepEqual(page.messages.map(message => message.id), sent.slice(0, 100).map(message => message.id));
   await b.client.acknowledge('4040', b.session, paired.connection!.generation, page.cursor);
@@ -189,4 +190,17 @@ test('pane streams only the verified word and timing; local context and credenti
   for (const name of ['token', 'session_id', 'messages', 'connection', 'device']) assert.equal(value[name], undefined);
   assert.equal((await fetch(a.info.url + '/ui', { headers: { Origin: 'https://foreign.example' } })).status, 403);
   assert.equal((await fetch(a.info.url + '/v1/status')).status, 401);
+});
+
+
+test('slow control receipts do not delay the next fresh proof or the sole inbox reader', { timeout: 20_000 }, async t => {
+  let receiptStarted = false;
+  const h = await fixture(t, relay => relay.addHook('preHandler', async request => {
+    if (request.url.endsWith('/ack')) { receiptStarted = true; await pause(400); }
+  }));
+  const a = await h.device('laptop'), b = await h.device('vm');
+  await Promise.all([a.client.pair('4040', a.session, 5000), b.client.pair('4040', b.session, 5000)]);
+  while (!receiptStarted) await pause(5);
+  const proof = await a.client.pair('4040', a.session, 250);
+  assert.equal(proof.verified, true); assert.ok(proof.proof_round_trip_ms! < 250);
 });

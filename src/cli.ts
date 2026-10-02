@@ -33,9 +33,10 @@ daemons.command('start').action(async () => {
   }
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'daemon', 'run'], { detached: true, stdio: 'ignore', windowsHide: true });
   const spawned = new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); }); await spawned; child.unref();
-  const deadline = Date.now() + 5000;
+  child.on('error', () => {});
+  const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) { try { const info = await daemonInfo(); await new DaemonClient(info).status(); output({ running: true, pid: info.pid, url: info.url }); return; } catch { await pause(50); } }
-  throw new BridgeError(0, 'DAEMON_START_TIMEOUT', 'Local runtime did not become ready within five seconds');
+  throw new BridgeError(0, 'DAEMON_START_TIMEOUT', 'Local runtime did not become ready within thirty seconds; a detached startup may still be running');
 });
 async function runtimeSession(channel: string, explicit?: string) {
   const config = await readConfig();
