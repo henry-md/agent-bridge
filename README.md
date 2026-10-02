@@ -62,6 +62,24 @@ A file connector is needed for remote folder reads, but channel pairing and mess
 
 `send --ack CURSOR --watch` reuses one process and HTTP pool for sending, acknowledging and waiting. Its first JSON line confirms the sent reply; the second contains the next inbox page. Only pass a cursor whose mail you have processed. With a positive `--ack` cursor, retries default to a stable reply key derived from that cursor, scoped by the server to this generation and sending session. A reply bound to processed mail stops if that generation has ended. If a later acknowledgment or watch fails, the first receipt still describes a delivered message; retry the same reply without changing its key or payload. An intentional different reply to the same cursor needs a new `--idempotency-key`.
 
+## Resident runtime
+
+For repeated sessions, keep one local process and its HTTP connections warm:
+
+```sh
+bridge daemon start
+bridge channel pair 4040 --daemon --watch
+bridge send --channel 4040 --daemon --text 'Hello' --ack CURSOR --watch --timeout 600
+bridge channel leave 4040 --daemon
+bridge daemon stop
+```
+
+The runtime owns one relay reader per channel. Agent receives use authenticated loopback RPC; ordinary messages remain in SQLite until explicitly acknowledged. Each pair request exchanges a fresh UUID nonce through the authenticated message mailbox and checks its echo against the current generation, pairing, sessions and word. `proof_round_trip_ms` measures the proof; `runtime_setup_ms` includes the caller's setup work. Neither includes a model response.
+
+Open the URL from `bridge daemon status`, followed by `/ui?channel=4040`, for a live word and proof timing. This read-only pane exposes no messages, files, session identifiers or credentials. It shows a word only after a fresh proof and reconnects to the same local port after a daemon restart. The private descriptor and active channel registry live beside/in the existing local configuration, outside Git. An exclusive loopback listener prevents duplicate daemon ownership. Restart restores the same session IDs and replays unacknowledged ordinary mail; `watch --daemon` follows an updated descriptor within its original deadline. Changing account credentials clears saved runtime channels. An expired generation with pending mail stops rather than acknowledging across generations.
+
+Do not run a direct `watch` or `inbox` reader alongside the runtime. Use `--daemon` for pair, watch, send-with-ack/watch, ack and leave. Streamed uploads, authenticated downloads, checksums and the outbound file connector retain their existing interfaces.
+
 ## Build and run locally
 
 Requires Node.js 24 or newer on each computer. Clone this repo, then:
